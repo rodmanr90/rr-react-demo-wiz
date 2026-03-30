@@ -1,0 +1,382 @@
+name: Demo Lifecycle (Deploy + Optional Destroy)
+
+run-name: >-
+  Demo Lifecycle |
+  wiz=${{ inputs.enable_wiz }} |
+  destroy=${{ inputs.destroy }} |
+  name=${{ inputs.deployment_name != '' && inputs.deployment_name || format('r{0}-{1}', github.run_id, github.run_attempt) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_wiz:
+        description: "Enable full Wiz demo mode (Wiz Terraform resources + Wiz CLI scans). Disable for standalone infra only."
+        required: true
+        default: true
+        type: boolean
+      skip_image:
+        description: "Skip building/pushing app image (faster). Use only if image already exists and you know the impact."
+        required: true
+        default: false
+        type: boolean
+      skip_verify:
+        description: "Skip post-deploy verification checks (Kubernetes readiness checks only; no public NLB curl)."
+        required: true
+        default: false
+        type: boolean
+      destroy:
+        description: "Destroy at the end. Set false to keep environment running for live demos."
+        required: true
+        default: false
+        type: boolean
+      destroy_backend:
+        description: "Also destroy shared S3 Terraform backend (use with care; breaks Wiz IaC mapping continuity until recreated)."
+        required: true
+        default: false
+        type: boolean
+      deployment_name:
+        description: "Optional deployment identifier (3-16 chars: a-z, 0-9, -). If empty, auto-generated from run id."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: demo-cycle
+  cancel-in-progress: false
+
+jobs:
+  deploy_destroy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+
+      # Wiz provider auth (required for terraform apply if wiz resources are enabled)
+      WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+      WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+
+      # Wiz CLI auth (used for Wiz Code scans from CI)
+      WIZ_CLI_CLIENT_ID: ${{ secrets.WIZ_CLI_CLIENT_ID }}
+      WIZ_CLI_CLIENT_SECRET: ${{ secrets.WIZ_CLI_CLIENT_SECRET }}
+
+      # Terraform vars (optional but usually required for full demo fidelity)
+      TF_VAR_wiz_tenant_id: ${{ secrets.TF_VAR_wiz_tenant_id }}
+      TF_VAR_wiz_trusted_arn: ${{ secrets.TF_VAR_wiz_trusted_arn }}
+      TF_VAR_wiz_client_environment: ${{ secrets.TF_VAR_wiz_client_environment }}
+      TF_VAR_tenant_image_pull_username: ${{ secrets.TF_VAR_tenant_image_pull_username }}
+      TF_VAR_tenant_image_pull_password: ${{ secrets.TF_VAR_tenant_image_pull_password }}
+      TF_VAR_allowed_cidrs: ${{ secrets.TF_VAR_allowed_cidrs }}
+      TF_VAR_deployment_name: ${{ inputs.deployment_name != '' && inputs.deployment_name || format('r{0}-{1}', github.run_id, github.run_attempt) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show run intent
+        shell: bash
+        run: |
+          set -euo pipefail
+          tf_dir="infrastructure/demo"
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then
+            tf_dir="infrastructure/demo-nowiz"
+          fi
+
+          if [[ "${{ inputs.destroy }}" == "true" ]]; then
+            destroy_mode="Will destroy infrastructure at end of run."
+          else
+            destroy_mode="Will keep infrastructure running for live demo follow-up."
+          fi
+
+          {
+            echo "## Run Intent"
+            echo ""
+            echo "- Workflow: \`Demo Lifecycle (Deploy + Optional Destroy)\`"
+            echo "- Terraform root: \`$tf_dir\`"
+            echo "- enable_wiz: \`${{ inputs.enable_wiz }}\`"
+            echo "- skip_image: \`${{ inputs.skip_image }}\`"
+            echo "- skip_verify: \`${{ inputs.skip_verify }}\`"
+            echo "- destroy: \`${{ inputs.destroy }}\`"
+            echo "- destroy_backend: \`${{ inputs.destroy_backend }}\`"
+            echo "- deployment_name: \`${{ inputs.deployment_name != '' && inputs.deployment_name || format('r{0}-{1}', github.run_id, github.run_attempt) }}\`"
+            echo ""
+            echo "- Mode: ${destroy_mode}"
+            echo ""
+            echo "Cleanup reminder: if \`destroy=false\`, run this workflow again with \`destroy=true\` when demo validation is complete."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install mise
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://mise.jdx.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          mise --version
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise trust --all --yes
+          mise install
+
+      - name: Install wizcli
+        if: ${{ inputs.enable_wiz }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64" -o /usr/local/bin/wizcli
+          chmod +x /usr/local/bin/wizcli
+          wizcli version
+
+      - name: Confirm AWS identity (guardrail)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .mise-tasks/scripts/demo-aws.sh
+          demo_aws_activate
+          aws sts get-caller-identity --output json
+
+      - name: Bootstrap backend (shared, for Wiz code-to-cloud mapping)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tf_dir="infrastructure/demo"
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then tf_dir="infrastructure/demo-nowiz"; fi
+          # IMPORTANT: Wiz code-to-cloud mapping relies on Terraform state being
+          # accessible long enough for Wiz to ingest it. We therefore reuse a
+          # stable S3 backend (configured via SSM by `bootstrap-branch`) instead
+          # of creating/destroying a fresh state bucket each run.
+          mise run bootstrap-branch --force --branch "main" --directories "$tf_dir"
+
+      - name: Sync committed backend files to active AWS account
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mise run sync-backend-files
+
+          sync_files=(
+            infrastructure/backend-config.json
+            infrastructure/backends/backend.tf
+            infrastructure/demo/backend.tf
+            infrastructure/demo-nowiz/backend.tf
+          )
+
+          if git diff --quiet -- "${sync_files[@]}"; then
+            echo "Backend files already match active backend config."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${sync_files[@]}"
+          git commit -m "chore: sync backend files for ${AWS_REGION} (${GITHUB_RUN_ID})"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Show generated backend.tf (for debugging/portability)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tf_dir="infrastructure/demo"
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then tf_dir="infrastructure/demo-nowiz"; fi
+
+          echo "=== ${tf_dir}/backend.tf ==="
+          if [[ -f "${tf_dir}/backend.tf" ]]; then
+            cat "${tf_dir}/backend.tf"
+          else
+            echo "MISSING: ${tf_dir}/backend.tf"
+          fi
+          echo ""
+          echo "=== infrastructure/backends/backend.tf ==="
+          if [[ -f "infrastructure/backends/backend.tf" ]]; then
+            cat "infrastructure/backends/backend.tf"
+          else
+            echo "MISSING: infrastructure/backends/backend.tf"
+          fi
+
+      - name: Deploy demo
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then args+=("--no-wiz"); fi
+          if [[ "${{ inputs.skip_image }}" == "true" ]]; then args+=("--skip-image"); fi
+          if [[ "${{ inputs.skip_verify }}" == "true" ]]; then args+=("--skip-verify"); fi
+          mise run deploy-demo "${args[@]}"
+
+      - name: Capture Terraform outputs (for consistent identifiers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tf_dir="infrastructure/demo"
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then tf_dir="infrastructure/demo-nowiz"; fi
+
+          deployment_name="$(mise exec -- terraform -chdir="$tf_dir" output -raw deployment_name || true)"
+          suffix="$(mise exec -- terraform -chdir="$tf_dir" output -raw suffix || true)"
+          cluster="$(mise exec -- terraform -chdir="$tf_dir" output -raw cluster_name || true)"
+          ns="$(mise exec -- terraform -chdir="$tf_dir" output -raw react2shell_namespace || true)"
+          deploy="$(mise exec -- terraform -chdir="$tf_dir" output -raw react2shell_deployment_name || true)"
+          svc="$(mise exec -- terraform -chdir="$tf_dir" output -raw react2shell_service_name || true)"
+          bucket="$(mise exec -- terraform -chdir="$tf_dir" output -raw react2shell_s3_bucket || true)"
+          wiz_role="$(mise exec -- terraform -chdir="$tf_dir" output -raw wiz_connector_role_arn || true)"
+
+          {
+            echo "## Demo Identifiers"
+            echo ""
+            echo "- Terraform root: \`$tf_dir\`"
+            echo "- deployment_name: \`$deployment_name\`"
+            echo "- suffix: \`$suffix\`"
+            echo "- cluster_name: \`$cluster\`"
+            echo "- namespace: \`$ns\`"
+            echo "- deployment: \`$deploy\`"
+            echo "- service: \`$svc\`"
+            echo "- s3_bucket: \`$bucket\`"
+            echo "- wiz_role_arn: \`$wiz_role\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify deployment (runner-independent)
+        if: ${{ !inputs.skip_verify }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export KUBECONFIG="${GITHUB_WORKSPACE}/kubeconfig"
+
+          tf_dir="infrastructure/demo"
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then tf_dir="infrastructure/demo-nowiz"; fi
+
+          deployment_name="$(mise exec -- terraform -chdir="$tf_dir" output -raw deployment_name)"
+          ns="$(mise exec -- terraform -chdir="$tf_dir" output -raw react2shell_namespace)"
+          deploy="$(mise exec -- terraform -chdir="$tf_dir" output -raw react2shell_deployment_name)"
+          svc="$(mise exec -- terraform -chdir="$tf_dir" output -raw react2shell_service_name)"
+
+          echo "Deployment: $deployment_name"
+          echo "App namespace: $ns"
+          echo "App deployment: $deploy"
+          echo "App service: $svc"
+
+          mise exec -- kubectl get nodes -o wide
+          mise exec -- kubectl -n "$ns" get deploy,svc,po -o wide
+          mise exec -- kubectl -n "$ns" rollout status "deployment/${deploy}" --timeout=10m
+
+          if [[ "${{ inputs.enable_wiz }}" == "true" ]]; then
+            # Wiz components should be present if the chart is enabled and pull creds are configured.
+            # Do not fail the demo-cycle if Wiz pods are absent (demo credentials may be missing).
+            mise exec -- kubectl -n wiz get deploy,ds,po -o wide || true
+            mise exec -- kubectl -n wiz rollout status deployment/wiz-kubernetes-integration-agent --timeout=10m || true
+            mise exec -- kubectl -n wiz rollout status deployment/wiz-kubernetes-integration-wiz-admission-controller --timeout=10m || true
+            mise exec -- kubectl -n wiz rollout status daemonset/wiz-kubernetes-integration-wiz-sensor --timeout=10m || true
+          else
+            echo "Wiz disabled for this run; skipping Wiz pod checks."
+          fi
+
+      - name: Wiz CLI scan (directory)
+        if: ${{ inputs.enable_wiz }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${WIZ_CLI_CLIENT_ID:-}" || -z "${WIZ_CLI_CLIENT_SECRET:-}" ]]; then
+            echo "Missing WIZ_CLI_CLIENT_ID/WIZ_CLI_CLIENT_SECRET; skipping wizcli scan."
+            exit 0
+          fi
+
+          set +e
+          timeout 15m wizcli scan dir . \
+            --client-id "$WIZ_CLI_CLIENT_ID" \
+            --client-secret "$WIZ_CLI_CLIENT_SECRET" \
+            --name "demo-cycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --tags "repo=${GITHUB_REPOSITORY}" \
+            --tags "commit=${GITHUB_SHA}" \
+            --tags "run_id=${GITHUB_RUN_ID}" \
+            --tags "workflow=demo-cycle"
+          scan_rc="$?"
+          set -e
+          if [[ "$scan_rc" -ne 0 ]]; then
+            echo "wizcli dir scan exited non-zero (${scan_rc}); continuing (demo-cycle should still clean up)."
+          fi
+
+      - name: Wiz CLI scan + tag (container image)
+        if: ${{ inputs.enable_wiz && !inputs.skip_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${WIZ_CLI_CLIENT_ID:-}" || -z "${WIZ_CLI_CLIENT_SECRET:-}" ]]; then
+            echo "Missing WIZ_CLI_CLIENT_ID/WIZ_CLI_CLIENT_SECRET; skipping wizcli container scan/tag."
+            exit 0
+          fi
+
+          ecr_url="$(mise exec -- terraform -chdir=infrastructure/demo output -raw ecr_repository_url)"
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          image_tag="git-${short_sha}"
+          image_ref="${ecr_url}:${image_tag}"
+
+          echo "ECR URL:   ${ecr_url}"
+          echo "Image ref: ${image_ref}"
+
+          # Best-effort: scan should publish results, but should not break the demo-cycle run.
+          set +e
+          timeout 25m wizcli scan container-image "${image_ref}" \
+            --client-id "$WIZ_CLI_CLIENT_ID" \
+            --client-secret "$WIZ_CLI_CLIENT_SECRET" \
+            --name "demo-cycle-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --tags "repo=${GITHUB_REPOSITORY}" \
+            --tags "commit=${GITHUB_SHA}" \
+            --tags "run_id=${GITHUB_RUN_ID}" \
+            --tags "workflow=demo-cycle"
+          scan_rc="$?"
+          set -e
+
+          # Exit codes: 0=pass, 1=general error, 2=invalid command, 3=auth error, 4=policy failure.
+          # For this repo, the workload is intentionally vulnerable; we still want to tag the
+          # pushed image digest for cloud-to-code mapping even if the scan fails by policy (4).
+          if [[ "$scan_rc" -ne 0 && "$scan_rc" -ne 4 ]]; then
+            echo "wizcli image scan exited non-zero (${scan_rc}); skipping tag."
+            exit 0
+          fi
+          if [[ "$scan_rc" -eq 4 ]]; then
+            echo "wizcli image scan failed by policy (4); continuing to tag anyway for mapping."
+          fi
+
+          # Tag the image digest in Wiz after a successful scan to enable cloud-to-code mapping.
+          repo_name="$(echo "${ecr_url}" | cut -d/ -f2-)"
+          digest=""
+          for i in {1..10}; do
+            digest="$(timeout 2m aws ecr describe-images --region "${AWS_REGION}" --repository-name "${repo_name}" \
+              --image-ids imageTag="${image_tag}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+            if [[ -n "${digest}" && "${digest}" != "None" ]]; then
+              break
+            fi
+            echo "Waiting for ECR image digest (${i}/10)..."
+            sleep 6
+          done
+
+          if [[ -z "${digest}" || "${digest}" == "None" ]]; then
+            echo "WARN: Could not resolve image digest from ECR for ${image_ref}; skipping wizcli tag."
+            exit 0
+          fi
+
+          set +e
+          timeout 5m wizcli tag "${image_ref}" \
+            --digest "${digest}" \
+            --client-id "$WIZ_CLI_CLIENT_ID" \
+            --client-secret "$WIZ_CLI_CLIENT_SECRET"
+          tag_rc="$?"
+          set -e
+          if [[ "$tag_rc" -ne 0 ]]; then
+            echo "wizcli tag exited non-zero (${tag_rc}); continuing."
+          fi
+
+      - name: Destroy demo (always attempt cleanup on failure)
+        if: ${{ always() && inputs.destroy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--no-dry-run)
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then args+=(--no-wiz); fi
+          if [[ "${{ inputs.destroy_backend }}" == "true" ]]; then args+=(--destroy-backend); fi
+          mise run destroy-demo "${args[@]}"

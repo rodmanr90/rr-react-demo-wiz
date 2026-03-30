@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#MISE description="Bootstraps the backend state infrastructure"
+#MISE dir="infrastructure/backends"
+
+#USAGE flag "--directories <dirs>" help="Comma-separated list of directories to run init-backends  in"
+#USAGE flag "--branch <branch>" help="Branch to use for the environment"
+#USAGE flag "--hocus-pocus" help="(Deprecated) Previously required for running on main/staging locally"
+#USAGE flag "--force" help="Force overwrite of existing backend-config.json (use with caution)"
+
+set -eo pipefail
+
+# Demo-only credentials are mandatory for this repo's safety guardrails.
+# shellcheck source=/dev/null
+source "$(command -v demo-aws.sh)"
+demo_aws_activate
+
+is_ci() {
+  [[ "${GITHUB_ACTIONS:-}" == "true" || "${CI:-}" == "true" ]]
+}
+
+# Determine branch/environment
+if [ -n "${usage_branch:-}" ]; then
+  BRANCH="$usage_branch"
+else
+  BRANCH=$(git rev-parse --abbrev-ref HEAD)
+fi
+
+# Normalize branch for SSM parameter names + tagging.
+BRANCH=$(echo "$BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+
+# This repo is a throwaway demo environment; treat all branch names as "dev"
+# unless the user explicitly overrides TF_VAR_environment.
+TF_VAR_environment="${TF_VAR_environment:-dev}"
+
+# NOTE: --hocus-pocus is kept for backwards-compat but no longer used.
+
+# Check if backend-config.json already exists (protect against accidental overwrite)
+BACKEND_CONFIG="../backend-config.json"
+if [[ -f "$BACKEND_CONFIG" ]] && [[ -z "${usage_force:-}" ]]; then
+  # If the bucket referenced in backend-config.json does not exist (or was
+  # destroyed), treat this as a broken state and allow re-bootstrap to recover.
+  EXISTING_BUCKET="$(jq -r '.state.bucket // empty' "$BACKEND_CONFIG" 2>/dev/null || true)"
+
+  if [[ -n "$EXISTING_BUCKET" ]] && aws s3api head-bucket --bucket "$EXISTING_BUCKET" >/dev/null 2>&1; then
+  echo ""
+  echo "[ERROR]: ⚠️  backend-config.json already exists!"
+  echo "[ERROR]: This file contains critical state configuration. Overwriting it could break existing deployments."
+  echo ""
+  echo "Current configuration:"
+  cat "$BACKEND_CONFIG" | jq -r '"  Bucket: \(.state.bucket)\n  Region: \(.state.region)\n  Environment: \(.environment)\n  Branch: \(.branch)"' 2>/dev/null || cat "$BACKEND_CONFIG"
+  echo ""
+  echo "[INFO]: If you want to use the existing configuration, run:"
+  echo "        mise run init-backends --directories <dirs>"
+  echo ""
+  echo "[INFO]: If you really want to bootstrap a NEW backend (and overwrite existing config), run:"
+  echo "        mise run bootstrap-branch --force --directories <dirs>"
+  echo ""
+  exit 1
+  fi
+
+  echo ""
+  echo "[WARN]: ⚠️  backend-config.json exists but the backend bucket is missing or not accessible."
+  echo "[WARN]: Proceeding to (re)bootstrap backend to recover."
+fi
+
+# Check if valid credentials exist
+if ! aws sts get-caller-identity &>/dev/null; then
+  echo "[Error]: Invalid or Missing AWS Credentials.  Please configure valid AWS credentials." >&2
+  exit 1
+fi
+
+echo "[INFO]: Working with environment: ${TF_VAR_environment:-}"
+echo "[INFO]: Your branch is currently set to ${BRANCH:-}"
+
+export TF_VAR_environment BRANCH
+SSM_PARAM_NAME="/demo/terraform/backend/$BRANCH/config"
+
+if ! is_ci; then
+  echo "[INFO]: ℹ️ Runtime Environment: Local Machine ℹ️ "
+
+  if [[ "${BRANCH:-}" == "main" || "${BRANCH:-}" == "staging" ]]; then
+    echo "[WARN]:⚠️ Running bootstrap on '$BRANCH' locally."
+    echo "[WARN]:⚠️ Guardrails require explicit AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, but this will create AWS resources."
+    echo "[WARN]: Your current user in the AWS Account with the state backend is: $(aws sts get-caller-identity --query Arn --output text)"
+    echo "[INFO]: Sleeping 3 seconds to allow cancellation (CTRL-C)..."
+    sleep 3
+  fi
+else
+  echo "[INFO]: ℹ️ Runtime Environment: Pipeline ℹ️ "
+fi
+
+BOOTSTRAP_NEW=true
+
+if aws ssm get-parameter --name "$SSM_PARAM_NAME" &>/dev/null; then
+  echo ""
+  echo "[INFO]: 🔍 Found existing backend configuration in Parameter Store"
+  aws ssm get-parameter --name "$SSM_PARAM_NAME" --query 'Parameter.Value' --output text >../backend-config.json
+
+  # Extract values for later use
+  BUCKET=$(jq -r '.state.bucket' ../backend-config.json)
+  REGION=$(jq -r '.state.region' ../backend-config.json)
+
+  if [[ -n "$BUCKET" ]] && aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
+    BOOTSTRAP_NEW=false
+  else
+    echo "[WARN]: ⚠️  Backend config exists in SSM but the bucket does not exist (or is not accessible)."
+    echo "[WARN]: Re-bootstrapping backend and overwriting SSM parameter: $SSM_PARAM_NAME"
+    aws ssm delete-parameter --name "$SSM_PARAM_NAME" >/dev/null 2>&1 || true
+    BOOTSTRAP_NEW=true
+  fi
+fi
+
+if [[ "$BOOTSTRAP_NEW" == "false" ]]; then
+  cat >backend.tf <<EOF
+terraform {
+  backend "s3" {
+    bucket       = "${BUCKET}"
+    key          = "bootstrap/terraform.tfstate"
+    region       = "${REGION}"
+    use_lockfile = true
+    encrypt      = true
+  }
+}
+EOF
+  echo "[INFO]: Reconfiguring backend"
+
+  cat >backend.hcl <<EOF
+bucket         = "${BUCKET}"
+region         = "${REGION}"
+EOF
+  terraform init -reconfigure
+
+else
+  echo ""
+  echo "[WARN]: 🚀 Bootstrapping new backend for $SSM_PARAM_NAME."
+  sleep 2
+  echo ""
+  echo "[INFO]: Creating new backend resources in $TF_VAR_environment environment."
+
+  # Clean .terraform directory and any backend.tf file
+  rm -rf .terraform .terraform.lock.hcl backend.tf backend.hcl
+
+  # Initialize and create backend resources with local state first
+  terraform init -reconfigure
+  TF_VAR_branch=$BRANCH terraform apply -auto-approve
+
+  # Get outputs for the new resources
+  terraform output -json backend_config >../backend-config.json
+
+  # Update the JSON with environment info
+  jq --arg branch "$BRANCH" \
+    --arg env "$TF_VAR_environment" \
+    '. += {"environment": $env, "branch": $branch}' \
+    ../backend-config.json >temp.json && mv temp.json ../backend-config.json
+
+  # Get values for later use
+  BUCKET=$(jq -r '.state.bucket' ../backend-config.json)
+  REGION=$(jq -r '.state.region' ../backend-config.json)
+
+  cat >backend.tf <<EOF
+terraform {
+  backend "s3" {
+    bucket       = "${BUCKET}"
+    key          = "bootstrap/terraform.tfstate"
+    region       = "${REGION}"
+    use_lockfile = true
+    encrypt      = true
+  }
+}
+EOF
+  echo "[INFO]: Reconfiguring backend"
+
+  cat >backend.hcl <<EOF
+bucket         = "${BUCKET}"
+region         = "${REGION}"
+EOF
+
+  # Migrate the local state to the S3 backend
+  echo "[INFO]: Migrating bootstrap state to the bucket it just created..."
+  terraform init -force-copy
+
+  # Store parameters in SSM for future use
+  aws ssm put-parameter \
+    --name "$SSM_PARAM_NAME" \
+    --type "String" \
+    --value "$(cat ../backend-config.json)" \
+    --overwrite
+
+  echo "[INFO]: Stored backend configuration in Parameter Store at $SSM_PARAM_NAME"
+fi
+
+echo "Backend configuration complete:"
+echo "  Environment: $TF_VAR_environment"
+echo "  Bucket: $BUCKET"
+echo "  Region: $REGION"
+
+echo "[INFO]: Bootstrap complete! Now running 'mise run init-backends' to configure backend.tf files in all directories."
+
+if ! is_ci; then
+  echo "[INFO]: Detected running locally, resetting backends"
+  echo "[INFO]: Removing all previous backend.tf files folders."
+  if ! mise run reset-backends; then
+    echo "[ERROR]: Failed to reset backends. Please check the logs."
+    exit 1
+  fi
+fi
+
+if [ -n "${usage_directories:-}" ]; then
+  echo "[INFO]: Creating and reinitializing backend.tf files with custom directories $usage_directories"
+  mise run init-backends --directories "$usage_directories"
+else
+  echo "[INFO]: Creating and reinitializing backend.tf files in all directories"
+  mise run init-backends
+fi

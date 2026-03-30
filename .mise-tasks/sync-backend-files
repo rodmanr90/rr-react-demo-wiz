@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#MISE description="Sync canonical backend.tf files from infrastructure/backend-config.json"
+
+set -eo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+BACKEND_CONFIG="$GIT_ROOT/infrastructure/backend-config.json"
+
+if [[ ! -f "$BACKEND_CONFIG" ]]; then
+  echo "ERROR: backend config not found: $BACKEND_CONFIG" >&2
+  echo "Run: mise run bootstrap-branch" >&2
+  exit 1
+fi
+
+bucket="$(jq -r '.state.bucket // empty' "$BACKEND_CONFIG")"
+region="$(jq -r '.state.region // empty' "$BACKEND_CONFIG")"
+
+if [[ -z "$bucket" || -z "$region" ]]; then
+  echo "ERROR: backend-config.json is missing .state.bucket or .state.region" >&2
+  cat "$BACKEND_CONFIG" >&2 || true
+  exit 1
+fi
+
+write_backend() {
+  local target="$1"
+  local key="$2"
+  cat >"$target" <<EOF
+terraform {
+  backend "s3" {
+    bucket       = "${bucket}"
+    key          = "${key}"
+    region       = "${region}"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+EOF
+}
+
+write_backend "$GIT_ROOT/infrastructure/backends/backend.tf" "bootstrap/terraform.tfstate"
+write_backend "$GIT_ROOT/infrastructure/demo/backend.tf" "infrastructure/demo/terraform.tfstate"
+write_backend "$GIT_ROOT/infrastructure/demo-nowiz/backend.tf" "infrastructure/demo-nowiz/terraform.tfstate"
+
+echo "Synced backend files using bucket=${bucket} region=${region}"

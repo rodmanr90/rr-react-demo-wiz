@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#MISE description="Run a deterministic in-cluster attack simulation (runner-independent; no public NLB access required)"
+
+#USAGE flag "--no-wiz" help="Use the standalone infra root (infrastructure/demo-nowiz)"
+
+set -eo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+
+DEMO_DIR_REL="infrastructure/demo"
+if [[ "${usage_no_wiz:-}" == "true" ]]; then
+  DEMO_DIR_REL="infrastructure/demo-nowiz"
+fi
+DEMO_DIR="$GIT_ROOT/$DEMO_DIR_REL"
+
+LOCAL_PORT="${ATTACK_SIM_LOCAL_PORT:-18080}"
+HOST="127.0.0.1:${LOCAL_PORT}"
+
+echo ""
+echo "=============================================="
+echo "  Wiz Demo - Attack Simulation"
+echo "=============================================="
+echo ""
+
+# -----------------------------------------------------------------------------
+# Demo-only AWS credentials (guardrail)
+# -----------------------------------------------------------------------------
+# shellcheck source=/dev/null
+source "$(command -v demo-aws.sh)"
+demo_aws_activate
+
+AWS_IDENTITY="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || echo "")"
+echo "✅ AWS: ${AWS_IDENTITY:-unknown}"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Prerequisites
+# -----------------------------------------------------------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "❌ python3 is required (used to generate the RCE payload)."
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "❌ curl is required."
+  exit 1
+fi
+
+KUBECTL=()
+if command -v kubectl >/dev/null 2>&1; then
+  KUBECTL=(kubectl)
+elif command -v mise >/dev/null 2>&1; then
+  KUBECTL=(mise exec -- kubectl)
+fi
+if [[ "${#KUBECTL[@]}" -eq 0 ]]; then
+  echo "❌ kubectl is required (install via mise)."
+  exit 1
+fi
+
+if [[ ! -d "$DEMO_DIR" ]]; then
+  echo "❌ Terraform root not found: $DEMO_DIR_REL"
+  exit 1
+fi
+if [[ ! -f "$DEMO_DIR/backend.tf" ]]; then
+  echo "❌ No backend.tf found in $DEMO_DIR_REL (did you run deploy-demo?)."
+  exit 1
+fi
+
+# Ensure we can read remote state outputs deterministically.
+terraform -chdir="$DEMO_DIR" init -input=false
+
+suffix="$(terraform -chdir="$DEMO_DIR" output -raw suffix 2>/dev/null || true)"
+deployment_name="$(terraform -chdir="$DEMO_DIR" output -raw deployment_name 2>/dev/null || true)"
+ns="$(terraform -chdir="$DEMO_DIR" output -raw react2shell_namespace 2>/dev/null || true)"
+deploy="$(terraform -chdir="$DEMO_DIR" output -raw react2shell_deployment_name 2>/dev/null || true)"
+svc="$(terraform -chdir="$DEMO_DIR" output -raw react2shell_service_name 2>/dev/null || true)"
+bucket="$(terraform -chdir="$DEMO_DIR" output -raw react2shell_s3_bucket 2>/dev/null || true)"
+
+if [[ -z "$suffix" || -z "$ns" || -z "$deploy" || -z "$svc" || -z "$bucket" || "$suffix" == "null" || "$ns" == "null" || "$deploy" == "null" || "$svc" == "null" || "$bucket" == "null" ]]; then
+  echo "❌ Missing Terraform outputs (suffix/react2shell_namespace/react2shell_deployment_name/react2shell_service_name/react2shell_s3_bucket)."
+  echo "   Ensure the demo is deployed and Terraform can read state."
+  exit 1
+fi
+
+echo "✅ Terraform root: $DEMO_DIR_REL"
+echo "✅ Deployment:     ${deployment_name:-$suffix}"
+echo "✅ Namespace:      $ns"
+echo "✅ Service:        $svc"
+echo "✅ Workload deploy: $deploy"
+echo "✅ S3 bucket:      $bucket"
+echo "✅ Target host:    $HOST (via kubectl port-forward)"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Ensure the workload is ready
+# -----------------------------------------------------------------------------
+"${KUBECTL[@]}" -n "$ns" rollout status "deployment/${deploy}" --timeout=10m
+
+# Ensure this run is deterministic: remove any existing compromise marker.
+pods_raw="$("${KUBECTL[@]}" -n "$ns" get pod -l "app=${svc}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+read -r -a pods <<<"$pods_raw"
+if [[ "${#pods[@]}" -gt 0 ]]; then
+  for pod in "${pods[@]}"; do
+    "${KUBECTL[@]}" -n "$ns" exec "$pod" -- rm -f /tmp/banner.json >/dev/null 2>&1 || true
+  done
+fi
+
+# -----------------------------------------------------------------------------
+# Port-forward the service to localhost (runner-independent access path)
+# -----------------------------------------------------------------------------
+pf_log="$(mktemp)"
+pf_pid=""
+
+cleanup() {
+  if [[ -n "${pf_pid:-}" ]]; then
+    kill "$pf_pid" >/dev/null 2>&1 || true
+    wait "$pf_pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$pf_log" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "🔌 Starting port-forward: svc/${svc} -> localhost:${LOCAL_PORT}"
+"${KUBECTL[@]}" -n "$ns" port-forward "svc/${svc}" "${LOCAL_PORT}:80" >"$pf_log" 2>&1 &
+pf_pid="$!"
+
+for _ in {1..30}; do
+  if grep -q "Forwarding from" "$pf_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$pf_pid" >/dev/null 2>&1; then
+    echo "❌ port-forward exited unexpectedly:"
+    sed -n '1,200p' "$pf_log" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! grep -q "Forwarding from" "$pf_log" 2>/dev/null; then
+  echo "❌ port-forward did not become ready:"
+  sed -n '1,200p' "$pf_log" 2>/dev/null || true
+  exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Run the exploit chain against the port-forwarded service
+# -----------------------------------------------------------------------------
+echo "🎯 Running exploit chain (RCE + post-exploitation + S3 exfil)..."
+"$GIT_ROOT/scripts/exploit/wiz-demo-v4.sh" "$HOST" --bucket "$bucket"
+
+# -----------------------------------------------------------------------------
+# Verify compromise marker exists (banner file dropped by Phase 1)
+# -----------------------------------------------------------------------------
+echo ""
+echo "🔎 Verifying compromise banner exists in the workload..."
+pods_raw="$("${KUBECTL[@]}" -n "$ns" get pod -l "app=${svc}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+read -r -a pods <<<"$pods_raw"
+
+if [[ "${#pods[@]}" -eq 0 ]]; then
+  echo "❌ Could not resolve react2shell pod name(s) (label app=${svc})."
+  exit 1
+fi
+
+banner_found="false"
+for pod in "${pods[@]}"; do
+  if "${KUBECTL[@]}" -n "$ns" exec "$pod" -- test -f /tmp/banner.json >/dev/null 2>&1; then
+    echo "✅ Banner present in pod ${pod}: /tmp/banner.json"
+    banner_found="true"
+    break
+  fi
+done
+
+if [[ "$banner_found" != "true" ]]; then
+  echo "❌ Banner not found in any matching pod; RCE may not have executed."
+  echo "   Pods checked:"
+  printf '   - %s\n' "${pods[@]}"
+  exit 1
+fi
+
+echo ""
+echo "✅ Attack simulation complete"

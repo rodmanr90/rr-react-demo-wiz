@@ -1,0 +1,193 @@
+name: Demo Attack Simulation (Defend Telemetry)
+
+run-name: >-
+  Attack Simulation |
+  wiz=${{ inputs.enable_wiz }} |
+  branch=${{ inputs.backend_branch }} |
+  port=${{ inputs.local_port }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_wiz:
+        description: "Match the mode used for the already-deployed environment (wiz-enabled vs no-wiz)."
+        required: true
+        default: true
+        type: boolean
+      backend_branch:
+        description: "Backend config branch in SSM (default: main). Must match branch used when backend was bootstrapped."
+        required: true
+        default: "main"
+        type: string
+      local_port:
+        description: "Local port used by kubectl port-forward on the runner."
+        required: true
+        default: "18080"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-cycle
+  cancel-in-progress: false
+
+jobs:
+  attack_sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ATTACK_SIM_LOCAL_PORT: ${{ inputs.local_port }}
+      KUBECONFIG: ${{ github.workspace }}/kubeconfig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show run intent
+        shell: bash
+        run: |
+          set -euo pipefail
+          tf_dir="infrastructure/demo"
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then
+            tf_dir="infrastructure/demo-nowiz"
+          fi
+
+          {
+            echo "## Run Intent"
+            echo ""
+            echo "- Workflow: \`Demo Attack Simulation (Defend Telemetry)\`"
+            echo "- Terraform root: \`$tf_dir\`"
+            echo "- enable_wiz: \`${{ inputs.enable_wiz }}\`"
+            echo "- backend_branch: \`${{ inputs.backend_branch }}\`"
+            echo "- local_port: \`${{ inputs.local_port }}\`"
+            echo ""
+            echo "Precondition: environment must already be deployed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup mise and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://mise.jdx.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          mise --version
+          mise trust --all --yes
+          mise install
+
+      - name: Resolve Terraform root
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.enable_wiz }}" == "true" ]]; then
+            echo "TF_DIR=infrastructure/demo" >> "$GITHUB_ENV"
+          else
+            echo "TF_DIR=infrastructure/demo-nowiz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Confirm AWS identity (guardrail)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .mise-tasks/scripts/demo-aws.sh
+          demo_aws_activate
+          aws sts get-caller-identity --output json
+
+      - name: Fetch backend config (assumes already bootstrapped)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .mise-tasks/scripts/demo-aws.sh
+          demo_aws_activate
+
+          branch="${{ inputs.backend_branch }}"
+          branch="$(echo "$branch" | tr '/' '-' | tr '[:upper:]' '[:lower:]')"
+          ssm_param="/demo/terraform/backend/${branch}/config"
+
+          echo "SSM param: ${ssm_param}"
+          if ! aws ssm get-parameter --name "$ssm_param" --query 'Parameter.Value' --output text > infrastructure/backend-config.json; then
+            echo "ERROR: Could not fetch backend config from SSM. Ensure the backend was bootstrapped and you have access."
+            exit 1
+          fi
+
+          bucket="$(jq -r '.state.bucket // empty' infrastructure/backend-config.json 2>/dev/null || true)"
+          region="$(jq -r '.state.region // empty' infrastructure/backend-config.json 2>/dev/null || true)"
+          if [[ -z "$bucket" || -z "$region" ]]; then
+            echo "ERROR: backend-config.json is missing .state.bucket or .state.region"
+            cat infrastructure/backend-config.json || true
+            exit 1
+          fi
+
+          echo "Backend bucket: $bucket"
+          echo "Backend region: $region"
+
+      - name: Init Terraform backend config (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise run init-backends --directories "$TF_DIR"
+
+      - name: Update kubeconfig (assumes EKS already exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cluster_name="$(mise exec -- terraform -chdir="$TF_DIR" output -raw cluster_name)"
+          cluster_region="$(mise exec -- terraform -chdir="$TF_DIR" output -raw aws_region || true)"
+          if [[ -z "${cluster_region:-}" || "${cluster_region}" == "null" ]]; then
+            cluster_region="${AWS_REGION:-}"
+          fi
+
+          if [[ -z "${cluster_name:-}" || "${cluster_name}" == "null" ]]; then
+            echo "ERROR: cluster_name output is empty; environment may not be deployed."
+            exit 1
+          fi
+          if [[ -z "${cluster_region:-}" ]]; then
+            echo "ERROR: Could not determine AWS region for EKS (set AWS_REGION secret or ensure terraform output aws_region exists)."
+            exit 1
+          fi
+
+          aws eks describe-cluster --name "$cluster_name" --region "$cluster_region" >/dev/null
+
+          aws eks update-kubeconfig --name "$cluster_name" --region "$cluster_region" --kubeconfig "$KUBECONFIG"
+
+          kubectl cluster-info
+
+      - name: Print target details (sanity checks)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deployment_name="$(mise exec -- terraform -chdir="$TF_DIR" output -raw deployment_name || true)"
+          suffix="$(mise exec -- terraform -chdir="$TF_DIR" output -raw suffix)"
+          ns="$(mise exec -- terraform -chdir="$TF_DIR" output -raw react2shell_namespace)"
+          deploy="$(mise exec -- terraform -chdir="$TF_DIR" output -raw react2shell_deployment_name)"
+          bucket="$(mise exec -- terraform -chdir="$TF_DIR" output -raw react2shell_s3_bucket)"
+          svc="$(mise exec -- terraform -chdir="$TF_DIR" output -raw react2shell_service_name)"
+
+          echo "Deployment: ${deployment_name:-$suffix}"
+          echo "Suffix: $suffix"
+          echo "Namespace: $ns"
+          echo "Workload deployment: $deploy"
+          echo "Service: $svc"
+          echo "S3 bucket: $bucket"
+
+          kubectl -n "$ns" get deploy,svc,po -o wide
+          nlb="$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+          if [[ -n "$nlb" ]]; then
+            echo "NLB hostname: $nlb"
+          else
+            echo "WARN: NLB hostname is empty (service may still be provisioning)."
+          fi
+
+      - name: Run attack simulation (runner-independent)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=()
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then args+=("--no-wiz"); fi
+          mise run attack-sim "${args[@]}"

@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+#MISE description="One-command deploy for infrastructure/demo single-root module"
+
+#USAGE flag "--skip-image" help="Skip building and pushing Docker image"
+#USAGE flag "--skip-verify" help="Skip deployment verification"
+#USAGE flag "--no-wiz" help="Disable all Wiz resources (AWS connector, K8s integration, Defend logging)"
+#USAGE flag "--deployment-name <name>" help="Deployment identifier used for all resource naming (3-16 chars: a-z, 0-9, -)"
+
+set -eo pipefail
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+DEMO_DIR_REL="infrastructure/demo"
+if [[ "${usage_no_wiz:-}" == "true" ]]; then
+  DEMO_DIR_REL="infrastructure/demo-nowiz"
+fi
+DEMO_DIR="$GIT_ROOT/$DEMO_DIR_REL"
+BACKEND_CONFIG="$GIT_ROOT/infrastructure/backend-config.json"
+
+is_ci() {
+  [[ "${GITHUB_ACTIONS:-}" == "true" || "${CI:-}" == "true" ]]
+}
+
+validate_deployment_name() {
+  local name="$1"
+  if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]{1,14}[a-z0-9]$ ]]; then
+    echo "❌ Invalid deployment name: $name"
+    echo "   Must be 3-16 chars, lowercase alphanumeric plus hyphen, and cannot start/end with hyphen."
+    return 1
+  fi
+}
+
+generate_deployment_name() {
+  local adjectives=(
+    bold
+    brisk
+    calm
+    clear
+    eager
+    swift
+    vivid
+  )
+  local animals=(
+    fox
+    hawk
+    lynx
+    otter
+    puma
+    wren
+  )
+  local adj="${adjectives[RANDOM % ${#adjectives[@]}]}"
+  local animal="${animals[RANDOM % ${#animals[@]}]}"
+  local hex
+  hex="$(printf '%03x' "$((RANDOM % 4096))")"
+  echo "${adj}-${animal}-${hex}"
+}
+
+echo ""
+echo "=============================================="
+echo "  Wiz Demo - Single Root Deployment"
+echo "=============================================="
+echo ""
+
+# -----------------------------------------------------------------------------
+# Step -1: Demo-only AWS credentials (guardrail)
+# -----------------------------------------------------------------------------
+# shellcheck source=/dev/null
+source "$(command -v demo-aws.sh)"
+demo_aws_activate
+
+# -----------------------------------------------------------------------------
+# Step 0: Verify Prerequisites
+# -----------------------------------------------------------------------------
+echo "📋 Checking prerequisites..."
+
+AWS_IDENTITY=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || echo "")
+echo "✅ AWS: ${AWS_IDENTITY:-unknown}"
+
+# Check Docker (unless skipping image)
+if [[ "${usage_skip_image:-}" != "true" ]]; then
+  if ! docker info &>/dev/null; then
+    echo "❌ Docker is not running. Start Docker or use --skip-image"
+    exit 1
+  fi
+  echo "✅ Docker: running"
+fi
+
+# Get region from environment or default
+REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-ap-southeast-2}}"
+echo "✅ Region: $REGION"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Step 0.5: Ensure EKS service-linked roles exist (new AWS accounts)
+# -----------------------------------------------------------------------------
+# In some AWS accounts, EKS managed node group creation can fail if the
+# AWSServiceRoleForAmazonEKSNodegroup service-linked role doesn't exist and
+# the caller/service can't auto-create it.
+echo "🔧 Ensuring EKS service-linked roles exist..."
+
+ensure_slr() {
+  local aws_service_name="$1"
+  local friendly_name="$2"
+
+  set +e
+  slr_out="$(aws iam create-service-linked-role --aws-service-name "$aws_service_name" 2>&1)"
+  slr_rc="$?"
+  set -e
+
+  if [[ "$slr_rc" -eq 0 ]]; then
+    echo "✅ Created service-linked role: ${friendly_name}"
+    return 0
+  fi
+
+  # Role already exists (AWS returns InvalidInput/EntityAlreadyExists variants).
+  if echo "$slr_out" | grep -Eq "has been taken in this account|already exists|EntityAlreadyExists|InvalidInput"; then
+    echo "✅ Service-linked role already exists: ${friendly_name}"
+    return 0
+  fi
+
+  echo "❌ Failed to ensure service-linked role (${friendly_name})"
+  echo "$slr_out"
+  echo "Hint: ensure your AWS credentials can call iam:CreateServiceLinkedRole for ${aws_service_name}"
+  return 1
+}
+
+# EKS cluster role is usually created automatically during cluster creation, but
+# we ensure it here for portability.
+ensure_slr "eks.amazonaws.com" "AWSServiceRoleForAmazonEKS"
+ensure_slr "eks-nodegroup.amazonaws.com" "AWSServiceRoleForAmazonEKSNodegroup"
+
+# -----------------------------------------------------------------------------
+# Optional: Disable Wiz for faster/standalone runs
+# -----------------------------------------------------------------------------
+if [[ "${usage_no_wiz:-}" == "true" ]]; then
+  echo "⛔ Wiz disabled (--no-wiz). Using Terraform root: $DEMO_DIR_REL"
+  echo ""
+fi
+
+# In CI/GitHub Actions, do not attempt to verify via the public NLB (runner IP
+# varies and may be blocked by NetworkPolicy). Use kubectl readiness checks in
+# the workflow instead.
+SKIP_VERIFY="${usage_skip_verify:-false}"
+if is_ci; then
+  SKIP_VERIFY="true"
+fi
+
+# Always define this (even when --skip-verify) to avoid nounset failures.
+NLB=""
+
+# -----------------------------------------------------------------------------
+# Step 1: Bootstrap (if needed)
+# -----------------------------------------------------------------------------
+if [[ ! -f "$BACKEND_CONFIG" ]]; then
+  echo "🔧 Step 1: Bootstrapping state backend..."
+  mise run bootstrap-branch --directories "$DEMO_DIR_REL"
+  echo ""
+else
+  # backend-config.json exists, but the bucket may have been deleted (e.g. a CI
+  # run with destroy_backend=true). Detect and self-heal.
+  bucket="$(jq -r '.state.bucket // empty' "$BACKEND_CONFIG" 2>/dev/null || true)"
+  if [[ -n "$bucket" ]] && aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+    echo "✅ Step 1: Backend already bootstrapped"
+  else
+    echo "⚠️  Step 1: Backend config exists but bucket is missing; re-bootstrapping..."
+    mise run bootstrap-branch --directories "$DEMO_DIR_REL"
+    echo ""
+  fi
+fi
+
+# Ensure demo directory has backend.tf
+if [[ ! -f "$DEMO_DIR/backend.tf" ]]; then
+  echo "🔧 Initializing backend for $DEMO_DIR_REL..."
+  mise run init-backends --directories "$DEMO_DIR_REL"
+fi
+echo ""
+
+# -----------------------------------------------------------------------------
+# Step 2: Terraform Apply
+# -----------------------------------------------------------------------------
+echo "🏗️  Step 2: Applying ${DEMO_DIR_REL}..."
+echo ""
+
+cd "$DEMO_DIR"
+
+# If we are going to verify the app via its public NLB, auto-detect the local
+# public IP and allow it through the app's NetworkPolicy.
+if [[ "${AUTO_DETECT_PUBLIC_IP:-}" == "true" ]] && ! is_ci; then
+  echo "🔎 AUTO_DETECT_PUBLIC_IP=true, detecting public IP for NetworkPolicy allowed CIDRs..."
+  # get-my-ip prints export statements; eval applies them to this process env.
+  eval "$(mise run get-my-ip)"
+  echo ""
+fi
+
+terraform init -input=false
+
+requested_deployment_name="${usage_deployment_name:-${TF_VAR_deployment_name:-}}"
+existing_deployment_name="$(
+  terraform output -json 2>/dev/null | jq -r '(.deployment_name.value // .suffix.value // "")' 2>/dev/null || true
+)"
+if [[ "$existing_deployment_name" == "null" ]]; then
+  existing_deployment_name=""
+fi
+
+if [[ -n "$requested_deployment_name" ]]; then
+  DEPLOYMENT_SLUG="$requested_deployment_name"
+  if [[ -n "$existing_deployment_name" && "$existing_deployment_name" != "$requested_deployment_name" ]]; then
+    echo "⚠️  Existing state deployment name is '$existing_deployment_name' but requested '$requested_deployment_name'."
+    echo "   Terraform may replace resources to converge on the requested deployment name."
+  fi
+elif [[ -n "$existing_deployment_name" ]]; then
+  DEPLOYMENT_SLUG="$existing_deployment_name"
+else
+  DEPLOYMENT_SLUG="$(generate_deployment_name)"
+fi
+
+validate_deployment_name "$DEPLOYMENT_SLUG"
+export TF_VAR_deployment_name="$DEPLOYMENT_SLUG"
+echo "✅ Deployment name: $DEPLOYMENT_SLUG"
+echo ""
+
+# Wiz provider/API calls can occasionally fail transiently (network EOF, timeouts).
+# For Wiz-enabled runs, retry a few times before failing the demo cycle.
+apply_attempts=0
+max_attempts="${TERRAFORM_APPLY_MAX_ATTEMPTS:-3}"
+retry_sleep_seconds="${TERRAFORM_APPLY_RETRY_SLEEP_SECONDS:-20}"
+while :; do
+  apply_attempts=$((apply_attempts + 1))
+  echo "Running terraform apply (attempt ${apply_attempts}/${max_attempts})..."
+
+  apply_log="$(mktemp)"
+  set +e
+  terraform apply -auto-approve 2>&1 | tee "$apply_log"
+  apply_rc=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$apply_rc" -eq 0 ]]; then
+    rm -f "$apply_log" 2>/dev/null || true
+    break
+  fi
+
+  # If Wiz is disabled, do not retry (avoid masking real infra issues).
+  if [[ "${usage_no_wiz:-}" == "true" ]]; then
+    rm -f "$apply_log" 2>/dev/null || true
+    exit "$apply_rc"
+  fi
+
+  if [[ "$apply_attempts" -ge "$max_attempts" ]]; then
+    echo "❌ terraform apply failed after ${apply_attempts} attempts"
+    rm -f "$apply_log" 2>/dev/null || true
+    exit "$apply_rc"
+  fi
+
+  if grep -q "wiz.io" "$apply_log" && grep -Eq "unexpected EOF|TLS handshake timeout|context deadline exceeded|connection reset by peer|i/o timeout" "$apply_log"; then
+    echo "⚠️  Transient Wiz API failure detected; retrying in ${retry_sleep_seconds}s..."
+    rm -f "$apply_log" 2>/dev/null || true
+    sleep "$retry_sleep_seconds"
+    continue
+  fi
+
+  rm -f "$apply_log" 2>/dev/null || true
+  exit "$apply_rc"
+done
+
+# Get outputs
+CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "wiz-demo-eks")
+DEPLOYMENT_SLUG_OUTPUT="$(terraform output -raw deployment_name 2>/dev/null || terraform output -raw suffix 2>/dev/null || echo "")"
+NAMESPACE="$(terraform output -raw react2shell_namespace 2>/dev/null || echo "")"
+APP_DEPLOYMENT_NAME="$(terraform output -raw react2shell_deployment_name 2>/dev/null || echo "")"
+SERVICE_NAME="$(terraform output -raw react2shell_service_name 2>/dev/null || echo "")"
+
+if [[ -z "$DEPLOYMENT_SLUG_OUTPUT" || "$DEPLOYMENT_SLUG_OUTPUT" == "null" ]]; then
+  DEPLOYMENT_SLUG_OUTPUT="$DEPLOYMENT_SLUG"
+fi
+if [[ -z "$DEPLOYMENT_SLUG_OUTPUT" || "$DEPLOYMENT_SLUG_OUTPUT" == "null" ]]; then
+  DEPLOYMENT_SLUG_OUTPUT="unknown"
+fi
+
+# Backward-compatible fallbacks (in case outputs are missing for older states).
+if [[ -z "$NAMESPACE" || "$NAMESPACE" == "null" ]]; then
+  NAMESPACE="react2shell-${DEPLOYMENT_SLUG_OUTPUT}"
+fi
+if [[ -z "$APP_DEPLOYMENT_NAME" || "$APP_DEPLOYMENT_NAME" == "null" ]]; then
+  APP_DEPLOYMENT_NAME="react2shell-${DEPLOYMENT_SLUG_OUTPUT}"
+fi
+if [[ -z "$SERVICE_NAME" || "$SERVICE_NAME" == "null" ]]; then
+  SERVICE_NAME="react2shell-${DEPLOYMENT_SLUG_OUTPUT}"
+fi
+
+echo ""
+echo "✅ Infrastructure deployed (deployment: $DEPLOYMENT_SLUG_OUTPUT)"
+echo "✅ App namespace: $NAMESPACE"
+echo "✅ App deploy:    $APP_DEPLOYMENT_NAME"
+echo "✅ App service:   $SERVICE_NAME"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Step 3: Update Kubeconfig
+# -----------------------------------------------------------------------------
+echo "📋 Step 3: Updating kubeconfig..."
+export KUBECONFIG="${KUBECONFIG:-$GIT_ROOT/kubeconfig}"
+aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" --kubeconfig "$KUBECONFIG"
+echo "✅ Kubeconfig: $KUBECONFIG"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Step 4: Build and Push Docker Image
+# -----------------------------------------------------------------------------
+if [[ "${usage_skip_image:-}" != "true" ]]; then
+  echo "🐳 Step 4: Building and pushing Docker image..."
+  cd "$GIT_ROOT"
+  mise run build-image --push --tf-dir "$DEMO_DIR_REL"
+
+  echo ""
+  echo "Restarting deployment to pull new image..."
+  kubectl rollout restart deployment/"${APP_DEPLOYMENT_NAME}" -n "$NAMESPACE"
+  kubectl rollout status deployment/"${APP_DEPLOYMENT_NAME}" -n "$NAMESPACE" --timeout=120s
+  echo ""
+else
+  echo "⏭️  Step 4: Skipping image build (--skip-image)"
+  echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Step 5: Verify Deployment
+# -----------------------------------------------------------------------------
+if [[ "$SKIP_VERIFY" != "true" ]]; then
+  echo "🔍 Step 5: Verifying deployment..."
+  echo ""
+
+  # Wait for pods
+  echo "Waiting for pods..."
+  kubectl wait --for=condition=ready pod -l "app=${SERVICE_NAME}" -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
+
+  # Get NLB hostname
+  NLB=$(kubectl get svc "${SERVICE_NAME}" -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+
+  if [[ -n "$NLB" ]]; then
+    echo "Testing app connectivity..."
+    for i in {1..10}; do
+      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$NLB" 2>/dev/null || echo "000")
+      if [[ "$HTTP_CODE" == "200" ]]; then
+        echo "✅ App responding: HTTP $HTTP_CODE"
+        break
+      fi
+      echo "  Attempt $i: HTTP $HTTP_CODE (waiting...)"
+      sleep 10
+    done
+  fi
+  echo ""
+else
+  echo "⏭️  Step 5: Skipping verification (--skip-verify)"
+  echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------------
+echo "=============================================="
+echo "  Deployment Complete!"
+echo "=============================================="
+echo ""
+echo "Deployment: $DEPLOYMENT_SLUG_OUTPUT"
+echo "Cluster:    $CLUSTER_NAME"
+echo "Namespace:  $NAMESPACE"
+echo "Kubeconfig: $KUBECONFIG"
+echo ""
+if [[ -n "${NLB:-}" ]]; then
+  echo "App URL:    http://$NLB"
+else
+  echo "App URL:    (not checked)"
+fi
+echo ""
+echo "To destroy: mise run destroy-demo"
+echo ""

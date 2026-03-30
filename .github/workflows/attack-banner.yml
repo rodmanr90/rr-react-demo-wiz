@@ -1,0 +1,204 @@
+name: Demo Banner Toggle (Visual Proof)
+
+run-name: >-
+  Banner Toggle |
+  wiz=${{ inputs.enable_wiz }} |
+  reset=${{ inputs.reset_banner }} |
+  msg=${{ inputs.banner_message }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_wiz:
+        description: "Match the mode used for the already-deployed environment (wiz-enabled vs no-wiz)."
+        required: true
+        default: true
+        type: boolean
+      backend_branch:
+        description: "Backend config branch in SSM (default: main). Must match branch used when backend was bootstrapped."
+        required: true
+        default: "main"
+        type: string
+      reset_banner:
+        description: "If true, remove /tmp/banner.json (revert banner change)."
+        required: true
+        default: false
+        type: boolean
+      banner_message:
+        description: "Banner text to set when reset_banner=false."
+        required: true
+        default: "COMPROMISED"
+        type: string
+      local_port:
+        description: "Local port used by kubectl port-forward on the runner."
+        required: true
+        default: "18081"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-cycle
+  cancel-in-progress: false
+
+jobs:
+  attack_banner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      BANNER_LOCAL_PORT: ${{ inputs.local_port }}
+      KUBECONFIG: ${{ github.workspace }}/kubeconfig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show run intent
+        shell: bash
+        run: |
+          set -euo pipefail
+          tf_dir="infrastructure/demo"
+          if [[ "${{ inputs.enable_wiz }}" != "true" ]]; then
+            tf_dir="infrastructure/demo-nowiz"
+          fi
+
+          action="Set banner message"
+          if [[ "${{ inputs.reset_banner }}" == "true" ]]; then
+            action="Reset banner (remove /tmp/banner.json)"
+          fi
+
+          {
+            echo "## Run Intent"
+            echo ""
+            echo "- Workflow: \`Demo Banner Toggle (Visual Proof)\`"
+            echo "- Terraform root: \`$tf_dir\`"
+            echo "- enable_wiz: \`${{ inputs.enable_wiz }}\`"
+            echo "- backend_branch: \`${{ inputs.backend_branch }}\`"
+            echo "- action: ${action}"
+            echo "- banner_message: \`${{ inputs.banner_message }}\`"
+            echo "- local_port: \`${{ inputs.local_port }}\`"
+            echo ""
+            echo "Precondition: environment must already be deployed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup mise and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://mise.jdx.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          mise --version
+          mise trust --all --yes
+          mise install
+
+      - name: Resolve Terraform root
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.enable_wiz }}" == "true" ]]; then
+            echo "TF_DIR=infrastructure/demo" >> "$GITHUB_ENV"
+          else
+            echo "TF_DIR=infrastructure/demo-nowiz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Confirm AWS identity (guardrail)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .mise-tasks/scripts/demo-aws.sh
+          demo_aws_activate
+          aws sts get-caller-identity --output json
+
+      - name: Fetch backend config (assumes already bootstrapped)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .mise-tasks/scripts/demo-aws.sh
+          demo_aws_activate
+
+          branch="${{ inputs.backend_branch }}"
+          branch="$(echo "$branch" | tr '/' '-' | tr '[:upper:]' '[:lower:]')"
+          ssm_param="/demo/terraform/backend/${branch}/config"
+
+          echo "SSM param: ${ssm_param}"
+          if ! aws ssm get-parameter --name "$ssm_param" --query 'Parameter.Value' --output text > infrastructure/backend-config.json; then
+            echo "ERROR: Could not fetch backend config from SSM. Ensure the backend was bootstrapped and you have access."
+            exit 1
+          fi
+
+      - name: Init Terraform backend config (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise run init-backends --directories "$TF_DIR"
+
+      - name: Update kubeconfig (assumes EKS already exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cluster_name="$(mise exec -- terraform -chdir="$TF_DIR" output -raw cluster_name)"
+          cluster_region="$(mise exec -- terraform -chdir="$TF_DIR" output -raw aws_region || true)"
+          if [[ -z "${cluster_region:-}" || "${cluster_region}" == "null" ]]; then
+            cluster_region="${AWS_REGION:-}"
+          fi
+
+          aws eks describe-cluster --name "$cluster_name" --region "$cluster_region" >/dev/null
+          aws eks update-kubeconfig --name "$cluster_name" --region "$cluster_region" --kubeconfig "$KUBECONFIG"
+          kubectl cluster-info
+
+      - name: Run banner action (runner-independent)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ns="$(mise exec -- terraform -chdir="$TF_DIR" output -raw react2shell_namespace)"
+          svc="$(mise exec -- terraform -chdir="$TF_DIR" output -raw react2shell_service_name)"
+
+          echo "Namespace: $ns"
+          echo "Service: $svc"
+          kubectl -n "$ns" get deploy,svc,po -o wide
+
+          pf_log="$(mktemp)"
+          pf_pid=""
+          cleanup() {
+            if [[ -n "${pf_pid:-}" ]]; then
+              kill "$pf_pid" >/dev/null 2>&1 || true
+              wait "$pf_pid" >/dev/null 2>&1 || true
+            fi
+            rm -f "$pf_log" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          target_host="127.0.0.1:${BANNER_LOCAL_PORT}"
+          echo "Starting port-forward to ${target_host} ..."
+          kubectl -n "$ns" port-forward "svc/${svc}" "${BANNER_LOCAL_PORT}:80" >"$pf_log" 2>&1 &
+          pf_pid="$!"
+
+          for _ in {1..30}; do
+            if grep -q "Forwarding from" "$pf_log" 2>/dev/null; then
+              break
+            fi
+            if ! kill -0 "$pf_pid" >/dev/null 2>&1; then
+              echo "ERROR: port-forward exited unexpectedly:"
+              sed -n '1,200p' "$pf_log" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if ! grep -q "Forwarding from" "$pf_log" 2>/dev/null; then
+            echo "ERROR: port-forward did not become ready:"
+            sed -n '1,200p' "$pf_log" 2>/dev/null || true
+            exit 1
+          fi
+
+          if [[ "${{ inputs.reset_banner }}" == "true" ]]; then
+            scripts/pwn-banner.sh "$target_host" --reset
+          else
+            scripts/pwn-banner.sh "$target_host" --message "${{ inputs.banner_message }}"
+          fi

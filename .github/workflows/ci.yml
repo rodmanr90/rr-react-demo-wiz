@@ -1,0 +1,72 @@
+name: CI Validation (Fmt + Terraform Validate)
+
+run-name: CI Validation | ${{ github.event_name }} | ${{ github.ref_name }}
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mise
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://mise.jdx.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          mise --version
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise trust --all --yes
+          mise install
+
+      - name: Terraform fmt (check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise exec -- terraform fmt -check -recursive
+
+      - name: Terraform validate (backends)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise exec -- terraform -chdir=infrastructure/backends init -backend=false -input=false
+          mise exec -- terraform -chdir=infrastructure/backends validate
+
+      - name: Terraform validate (demo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d infrastructure/demo ]]; then
+            # Some branches may not include the single-root module yet.
+            # Validate only if the module files are present.
+            if compgen -G "infrastructure/demo/*.tf" > /dev/null; then
+              mise exec -- terraform -chdir=infrastructure/demo init -backend=false -input=false
+              mise exec -- terraform -chdir=infrastructure/demo validate
+            fi
+          fi
+
+      - name: Terraform validate (demo-nowiz)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d infrastructure/demo-nowiz ]]; then
+            if compgen -G "infrastructure/demo-nowiz/*.tf" > /dev/null; then
+              mise exec -- terraform -chdir=infrastructure/demo-nowiz init -backend=false -input=false
+              mise exec -- terraform -chdir=infrastructure/demo-nowiz validate
+            fi
+          fi

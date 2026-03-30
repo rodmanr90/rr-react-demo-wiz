@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+#
+# Pre-destroy cleanup for AWS Load Balancer Controller resources
+#
+# Strategy (based on ensemble analysis from Claude + Codex):
+# 1. Delete LoadBalancer services via kubectl (lets controller clean up properly)
+# 2. Wait for controller to delete NLBs and security groups
+# 3. Verify cleanup before proceeding
+# 4. Force-delete any orphaned resources as fallback
+#
+# Usage: pre-destroy-cleanup <vpc_id> <region> [--dry-run]
+#
+
+set -eo pipefail
+
+VPC_ID="${1:-}"
+REGION="${2:-${AWS_DEFAULT_REGION:-${AWS_REGION:-ap-southeast-2}}}"
+DRY_RUN="${3:-}"
+
+if [[ -z "$VPC_ID" ]]; then
+  echo "Usage: pre-destroy-cleanup <vpc_id> <region> [--dry-run]"
+  echo "  VPC_ID is required to scope cleanup to specific VPC"
+  exit 1
+fi
+
+echo ""
+echo "=============================================="
+echo "  Pre-Destroy Cleanup for VPC: $VPC_ID"
+echo "=============================================="
+echo ""
+
+# -----------------------------------------------------------------------------
+# kubectl Resolution (system kubectl or mise-managed kubectl)
+# -----------------------------------------------------------------------------
+# GitHub runners don't always have `kubectl` on PATH; prefer mise if available.
+KUBECTL=()
+if command -v kubectl &>/dev/null; then
+  KUBECTL=(kubectl)
+elif command -v mise &>/dev/null; then
+  KUBECTL=(mise exec -- kubectl)
+fi
+
+kube_ok=false
+if [[ "${#KUBECTL[@]}" -gt 0 ]]; then
+  if "${KUBECTL[@]}" cluster-info >/dev/null 2>&1; then
+    kube_ok=true
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Step 1: Delete LoadBalancer Services (let controller clean up properly)
+# -----------------------------------------------------------------------------
+echo "🌐 Deleting LoadBalancer services (triggers controller cleanup)..."
+
+if [[ "$kube_ok" == "true" ]]; then
+  if [[ "$DRY_RUN" != "--dry-run" ]]; then
+    # Delete all LoadBalancer type services - this triggers the AWS LB Controller
+    # to properly clean up NLBs, target groups, and security groups
+    "${KUBECTL[@]}" delete svc -A --field-selector spec.type=LoadBalancer --timeout=120s 2>/dev/null || true
+    echo "  ✅ LoadBalancer services deleted"
+
+    # Give the controller time to process deletions
+    echo "  ⏳ Waiting 30s for AWS LB Controller to clean up resources..."
+    sleep 30
+  else
+    echo "  [DRY RUN] Would delete all LoadBalancer services"
+  fi
+else
+  echo "  ⚠️  kubectl not available or cluster unreachable"
+  echo "  (Will proceed with direct AWS resource cleanup)"
+fi
+
+# -----------------------------------------------------------------------------
+# Step 2: Wait for k8s-* Security Groups to be cleaned up
+# -----------------------------------------------------------------------------
+echo ""
+echo "🔍 Verifying k8s-* security groups are cleaned up..."
+
+if [[ "$DRY_RUN" != "--dry-run" ]]; then
+  WAIT_TIME=0
+  MAX_WAIT=120 # 2 minutes max
+
+  while [[ $WAIT_TIME -lt $MAX_WAIT ]]; do
+    SG_COUNT=$(aws ec2 describe-security-groups --region "$REGION" \
+      --filters "Name=vpc-id,Values=${VPC_ID}" \
+      --query "length(SecurityGroups[?starts_with(GroupName, 'k8s-')])" \
+      --output text 2>/dev/null || echo "0")
+
+    if [[ "$SG_COUNT" == "0" ]]; then
+      echo "  ✅ All k8s-* security groups cleaned up by controller"
+      break
+    fi
+
+    echo "  ⏳ Waiting for k8s-* security groups ($SG_COUNT remaining)..."
+    sleep 10
+    WAIT_TIME=$((WAIT_TIME + 10))
+  done
+
+  if [[ $WAIT_TIME -ge $MAX_WAIT ]]; then
+    echo "  ⚠️  Timeout waiting for controller cleanup - will force-delete"
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Step 3: Force-delete app namespaces (prevent Terminating hang)
+# -----------------------------------------------------------------------------
+echo ""
+echo "📦 Force-deleting app namespaces..."
+
+if [[ "$kube_ok" == "true" ]]; then
+  # Target namespaces that commonly get stuck:
+  # - react2shell-* (scenario)
+  # - argocd (legacy; should usually not exist anymore)
+  #
+  # IMPORTANT: Do not delete the `wiz` namespace here. The Wiz Helm release uses
+  # Helm uninstall hooks that run in that namespace; deleting it first will make
+  # `terraform destroy` fail.
+  APP_NAMESPACES=$("${KUBECTL[@]}" get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E '^(argocd|react2shell-)' || echo "")
+
+  if [[ -n "$APP_NAMESPACES" ]]; then
+    for NS in $APP_NAMESPACES; do
+      echo "  Force-deleting namespace: $NS"
+      if [[ "$DRY_RUN" != "--dry-run" ]]; then
+        # Step 1: Remove finalizers using the /finalize API (this is the key fix)
+        "${KUBECTL[@]}" get namespace "$NS" -o json 2>/dev/null |
+          jq '.spec.finalizers = []' |
+          "${KUBECTL[@]}" replace --raw "/api/v1/namespaces/$NS/finalize" -f - 2>/dev/null || true
+
+        # Step 2: Force delete the namespace
+        "${KUBECTL[@]}" delete namespace "$NS" --force --grace-period=0 --timeout=30s 2>/dev/null || true
+      else
+        echo "  [DRY RUN] Would force-delete: $NS"
+      fi
+    done
+    echo "  ✅ App namespaces force-deleted"
+  else
+    echo "  ✅ No app namespaces found"
+  fi
+else
+  echo "  ⚠️  kubectl not available or cluster unreachable - skipping namespace cleanup"
+  echo "  (This is expected if cluster is already destroyed)"
+fi
+
+# -----------------------------------------------------------------------------
+# Step 4: Force-delete Load Balancers in VPC (fallback)
+# -----------------------------------------------------------------------------
+echo ""
+echo "🔄 Force-deleting any remaining Load Balancers in VPC..."
+
+LB_ARNS=$(aws elbv2 describe-load-balancers --region "$REGION" \
+  --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" --output text 2>/dev/null || echo "")
+
+if [[ -z "$LB_ARNS" || "$LB_ARNS" == "None" ]]; then
+  echo "  ✅ No load balancers found in VPC"
+else
+  for LB_ARN in $LB_ARNS; do
+    LB_NAME=$(aws elbv2 describe-load-balancers --region "$REGION" \
+      --load-balancer-arns "$LB_ARN" \
+      --query 'LoadBalancers[0].LoadBalancerName' --output text 2>/dev/null || echo "unknown")
+
+    echo "  Deleting load balancer: $LB_NAME"
+    if [[ "$DRY_RUN" != "--dry-run" ]]; then
+      # Delete listeners first
+      LISTENER_ARNS=$(aws elbv2 describe-listeners --region "$REGION" \
+        --load-balancer-arn "$LB_ARN" \
+        --query 'Listeners[*].ListenerArn' --output text 2>/dev/null || echo "")
+      for LISTENER_ARN in $LISTENER_ARNS; do
+        aws elbv2 delete-listener --region "$REGION" --listener-arn "$LISTENER_ARN" 2>/dev/null || true
+      done
+
+      aws elbv2 delete-load-balancer --region "$REGION" --load-balancer-arn "$LB_ARN" 2>/dev/null || true
+      echo "    ✅ Deleted: $LB_NAME"
+    else
+      echo "    [DRY RUN] Would delete: $LB_NAME ($LB_ARN)"
+    fi
+  done
+
+  # Wait for load balancers to be fully deleted
+  if [[ "$DRY_RUN" != "--dry-run" ]]; then
+    echo "  ⏳ Waiting for load balancers to be fully deleted (max 60s)..."
+    WAIT_TIME=0
+    while [[ $WAIT_TIME -lt 60 ]]; do
+      REMAINING=$(aws elbv2 describe-load-balancers --region "$REGION" \
+        --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" --output text 2>/dev/null || echo "")
+      if [[ -z "$REMAINING" || "$REMAINING" == "None" ]]; then
+        echo "  ✅ All load balancers deleted"
+        break
+      fi
+      sleep 5
+      WAIT_TIME=$((WAIT_TIME + 5))
+    done
+
+    # IMPORTANT: Even after ELB reports deleted, the per-AZ ENIs can linger for
+    # several minutes. These ENIs block subnet deletion with DependencyViolation.
+    echo "  ⏳ Waiting for ELB ENIs to be fully released (max 10m)..."
+    WAIT_TIME=0
+    while [[ $WAIT_TIME -lt 600 ]]; do
+      ELB_ENI_COUNT=$(aws ec2 describe-network-interfaces --region "$REGION" \
+        --filters "Name=vpc-id,Values=${VPC_ID}" \
+        --query "length(NetworkInterfaces[?starts_with(Description, 'ELB net/') || starts_with(Description, 'ELB app/')])" \
+        --output text 2>/dev/null || echo "0")
+
+      if [[ "$ELB_ENI_COUNT" == "0" ]]; then
+        echo "  ✅ No ELB ENIs remain in VPC"
+        break
+      fi
+
+      echo "  ⏳ ELB ENIs still present: $ELB_ENI_COUNT"
+      sleep 15
+      WAIT_TIME=$((WAIT_TIME + 15))
+    done
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Step 5: Force-delete Target Groups in VPC (fallback)
+# -----------------------------------------------------------------------------
+echo ""
+echo "🎯 Force-deleting any remaining Target Groups..."
+
+TG_ARNS=$(aws elbv2 describe-target-groups --region "$REGION" \
+  --query "TargetGroups[?VpcId=='${VPC_ID}'].TargetGroupArn" --output text 2>/dev/null || echo "")
+
+if [[ -z "$TG_ARNS" || "$TG_ARNS" == "None" ]]; then
+  echo "  ✅ No target groups found in VPC"
+else
+  for TG_ARN in $TG_ARNS; do
+    TG_NAME=$(aws elbv2 describe-target-groups --region "$REGION" \
+      --target-group-arns "$TG_ARN" \
+      --query 'TargetGroups[0].TargetGroupName' --output text 2>/dev/null || echo "unknown")
+
+    echo "  Deleting target group: $TG_NAME"
+    if [[ "$DRY_RUN" != "--dry-run" ]]; then
+      aws elbv2 delete-target-group --region "$REGION" --target-group-arn "$TG_ARN" 2>/dev/null || true
+      echo "    ✅ Deleted: $TG_NAME"
+    else
+      echo "    [DRY RUN] Would delete: $TG_NAME"
+    fi
+  done
+fi
+
+# -----------------------------------------------------------------------------
+# Step 6: Force-delete k8s-* Security Groups in VPC (fallback)
+# -----------------------------------------------------------------------------
+echo ""
+echo "🔒 Force-deleting any remaining k8s-* security groups..."
+
+SG_IDS=$(aws ec2 describe-security-groups --region "$REGION" \
+  --filters "Name=vpc-id,Values=${VPC_ID}" \
+  --query "SecurityGroups[?starts_with(GroupName, 'k8s-')].GroupId" \
+  --output text 2>/dev/null || echo "")
+
+if [[ -z "$SG_IDS" || "$SG_IDS" == "None" ]]; then
+  echo "  ✅ No k8s-* security groups found in VPC"
+else
+  # First, remove all ingress/egress rules that reference these SGs
+  for SG_ID in $SG_IDS; do
+    SG_NAME=$(aws ec2 describe-security-groups --region "$REGION" \
+      --group-ids "$SG_ID" \
+      --query 'SecurityGroups[0].GroupName' --output text 2>/dev/null || echo "unknown")
+
+    echo "  Processing security group: $SG_NAME ($SG_ID)"
+
+    if [[ "$DRY_RUN" != "--dry-run" ]]; then
+      # Revoke all ingress rules
+      INGRESS_RULES=$(aws ec2 describe-security-groups --region "$REGION" \
+        --group-ids "$SG_ID" \
+        --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo "[]")
+      if [[ "$INGRESS_RULES" != "[]" && "$INGRESS_RULES" != "null" ]]; then
+        aws ec2 revoke-security-group-ingress --region "$REGION" \
+          --group-id "$SG_ID" --ip-permissions "$INGRESS_RULES" 2>/dev/null || true
+      fi
+
+      # Revoke all egress rules
+      EGRESS_RULES=$(aws ec2 describe-security-groups --region "$REGION" \
+        --group-ids "$SG_ID" \
+        --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null || echo "[]")
+      if [[ "$EGRESS_RULES" != "[]" && "$EGRESS_RULES" != "null" ]]; then
+        aws ec2 revoke-security-group-egress --region "$REGION" \
+          --group-id "$SG_ID" --ip-permissions "$EGRESS_RULES" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  # Now delete the security groups
+  for SG_ID in $SG_IDS; do
+    SG_NAME=$(aws ec2 describe-security-groups --region "$REGION" \
+      --group-ids "$SG_ID" \
+      --query 'SecurityGroups[0].GroupName' --output text 2>/dev/null || echo "unknown")
+
+    echo "  Deleting security group: $SG_NAME ($SG_ID)"
+    if [[ "$DRY_RUN" != "--dry-run" ]]; then
+      if aws ec2 delete-security-group --region "$REGION" --group-id "$SG_ID" 2>/dev/null; then
+        echo "    ✅ Deleted: $SG_NAME"
+        continue
+      fi
+
+      # If deletion fails, it's often because a non-k8s SG (e.g. the EKS node SG)
+      # still has a rule that references this k8s SG. Best-effort: revoke those
+      # references and retry once.
+      echo "    ⚠️  Delete failed; revoking references from other security groups and retrying..."
+
+      ALL_SGS_JSON="$(aws ec2 describe-security-groups --region "$REGION" \
+        --filters "Name=vpc-id,Values=${VPC_ID}" --output json 2>/dev/null || echo "")"
+
+      if [[ -n "$ALL_SGS_JSON" ]]; then
+        REF_GROUP_IDS="$(echo "$ALL_SGS_JSON" | jq -r --arg target "$SG_ID" '
+          .SecurityGroups[]
+          | select(
+              ((.IpPermissions // []) | map(select((.UserIdGroupPairs // []) | map(.GroupId) | index($target))) | length) > 0
+              or
+              ((.IpPermissionsEgress // []) | map(select((.UserIdGroupPairs // []) | map(.GroupId) | index($target))) | length) > 0
+            )
+          | .GroupId
+        ' 2>/dev/null || true)"
+
+        if [[ -n "$REF_GROUP_IDS" ]]; then
+          for REF_GID in $REF_GROUP_IDS; do
+            INGRESS_TO_REVOKE="$(echo "$ALL_SGS_JSON" | jq -c --arg gid "$REF_GID" --arg target "$SG_ID" '
+              (.SecurityGroups[] | select(.GroupId == $gid) | .IpPermissions // [])
+              | map(select((.UserIdGroupPairs // []) | map(.GroupId) | index($target)))
+            ' 2>/dev/null || echo "[]")"
+            if [[ "$INGRESS_TO_REVOKE" != "[]" ]]; then
+              aws ec2 revoke-security-group-ingress --region "$REGION" --group-id "$REF_GID" --ip-permissions "$INGRESS_TO_REVOKE" 2>/dev/null || true
+            fi
+
+            EGRESS_TO_REVOKE="$(echo "$ALL_SGS_JSON" | jq -c --arg gid "$REF_GID" --arg target "$SG_ID" '
+              (.SecurityGroups[] | select(.GroupId == $gid) | .IpPermissionsEgress // [])
+              | map(select((.UserIdGroupPairs // []) | map(.GroupId) | index($target)))
+            ' 2>/dev/null || echo "[]")"
+            if [[ "$EGRESS_TO_REVOKE" != "[]" ]]; then
+              aws ec2 revoke-security-group-egress --region "$REGION" --group-id "$REF_GID" --ip-permissions "$EGRESS_TO_REVOKE" 2>/dev/null || true
+            fi
+          done
+        fi
+      fi
+
+      if aws ec2 delete-security-group --region "$REGION" --group-id "$SG_ID" 2>/dev/null; then
+        echo "    ✅ Deleted: $SG_NAME"
+      else
+        echo "    ⚠️  Still unable to delete: $SG_NAME (will rely on terraform destroy completing EKS teardown)"
+      fi
+    else
+      echo "    [DRY RUN] Would delete: $SG_NAME ($SG_ID)"
+    fi
+  done
+fi
+
+echo ""
+echo "=============================================="
+echo "  Pre-Destroy Cleanup Complete"
+echo "=============================================="
+echo ""

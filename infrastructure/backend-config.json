@@ -1,0 +1,8 @@
+{
+  "state": {
+    "bucket": "demo-dev-008971668449-state-bucket-ap-southeast-2",
+    "region": "ap-southeast-2"
+  },
+  "environment": "dev",
+  "branch": "main"
+}

@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#MISE description="Build and push container image to ECR"
+
+#USAGE flag "--app <app>" default="nextjs" help="Application to build (default: nextjs)"
+#USAGE flag "--tag <tag>" default="latest" help="Image tag (default: latest)"
+#USAGE flag "--tf-dir <dir>" default="infrastructure/demo" help="Terraform root dir to read outputs from (default: infrastructure/demo)"
+#USAGE flag "--push" help="Push image to ECR after building"
+#USAGE flag "--no-cache" help="Build without using cache"
+
+set -eo pipefail
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+BACKEND_CONFIG="$GIT_ROOT/infrastructure/backend-config.json"
+TF_DIR_REL="${usage_tf_dir:-infrastructure/demo}"
+DEMO_DIR="$GIT_ROOT/$TF_DIR_REL"
+
+# -----------------------------------------------------------------------------
+# Demo-only AWS credentials (guardrail)
+# -----------------------------------------------------------------------------
+# shellcheck source=/dev/null
+source "$(command -v demo-aws.sh)"
+demo_aws_activate
+
+# Validate backend config exists
+if [[ ! -f "$BACKEND_CONFIG" ]]; then
+  echo "ERROR: backend-config.json not found. Run: mise run bootstrap-branch" >&2
+  exit 1
+fi
+
+# Read config
+REGION=$(jq -r '.state.region' "$BACKEND_CONFIG")
+APP_NAME="${usage_app:-nextjs}"
+TAG="${usage_tag:-latest}"
+APP_DIR="$GIT_ROOT/app/$APP_NAME"
+
+# Validate TF root exists
+if [[ ! -d "$DEMO_DIR" ]]; then
+  echo "ERROR: Terraform directory not found: $TF_DIR_REL" >&2
+  exit 1
+fi
+
+# Validate app directory exists
+if [[ ! -d "$APP_DIR" ]]; then
+  echo "ERROR: Application directory not found: $APP_DIR" >&2
+  echo "  Available apps:" >&2
+  find "$GIT_ROOT/app/" -maxdepth 1 -mindepth 1 -type d -printf '    - %f\n' 2>/dev/null >&2 || true
+  exit 1
+fi
+
+# Validate Dockerfile exists
+if [[ ! -f "$APP_DIR/Dockerfile" ]]; then
+  echo "ERROR: Dockerfile not found in $APP_DIR" >&2
+  exit 1
+fi
+
+real_aws=$(mise which aws 2>/dev/null || which aws)
+if ! "$real_aws" sts get-caller-identity --query Account --output text >/dev/null 2>&1; then
+  echo "ERROR: No valid AWS credentials found." >&2
+  echo "  Required env vars:" >&2
+  echo "    AWS_ACCESS_KEY_ID" >&2
+  echo "    AWS_SECRET_ACCESS_KEY" >&2
+  exit 1
+fi
+
+# Prefer reading ECR repo URL from Terraform outputs (single-root module).
+ECR_REPOSITORY_URL=""
+if [[ -f "$DEMO_DIR/backend.tf" ]]; then
+  ECR_REPOSITORY_URL="$(terraform -chdir="$DEMO_DIR" output -raw ecr_repository_url 2>/dev/null || true)"
+fi
+if [[ -z "$ECR_REPOSITORY_URL" ]]; then
+  echo "ERROR: Could not determine ECR repository URL from Terraform state." >&2
+  echo "  Terraform root: $TF_DIR_REL" >&2
+  echo "  Run: mise run deploy-demo --skip-image --skip-verify" >&2
+  echo "  Then retry: mise run build-image --push --tf-dir \"$TF_DIR_REL\"" >&2
+  exit 1
+fi
+
+# Tags for traceability (Wiz scan tagging + runtime attribution).
+GIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+SHORT_SHA="$(echo "$GIT_SHA" | cut -c1-12)"
+IMAGE_TAG_GIT="git-${SHORT_SHA}"
+IMAGE_TAG_RUN=""
+if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+  IMAGE_TAG_RUN="run-${GITHUB_RUN_ID}"
+fi
+
+# OCI labels help correlate images back to source.
+OCI_SOURCE="${GITHUB_SERVER_URL:-}"
+if [[ -n "${GITHUB_REPOSITORY:-}" && -n "$OCI_SOURCE" ]]; then
+  OCI_SOURCE="${OCI_SOURCE}/${GITHUB_REPOSITORY}"
+else
+  # Best-effort local fallback.
+  OCI_SOURCE="$(git config --get remote.origin.url 2>/dev/null || echo "")"
+fi
+OCI_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+echo "=== Build Configuration ==="
+echo "  App:        $APP_NAME"
+echo "  Directory:  $APP_DIR"
+echo "  Tag:        $TAG"
+echo "  ECR Repo:   $ECR_REPOSITORY_URL"
+echo "  Tags:       $TAG, $IMAGE_TAG_GIT${IMAGE_TAG_RUN:+, $IMAGE_TAG_RUN}"
+echo ""
+
+# Build image for amd64 (EKS nodes are amd64)
+echo "=== Building Image ==="
+DOCKER_BUILD=(docker build --platform linux/amd64)
+if docker buildx version >/dev/null 2>&1; then
+  # Ensures --platform is honored on Apple Silicon.
+  DOCKER_BUILD=(docker buildx build --platform linux/amd64 --load)
+fi
+DOCKER_TAGS=(
+  "-t" "${ECR_REPOSITORY_URL}:${TAG}"
+  "-t" "${ECR_REPOSITORY_URL}:${IMAGE_TAG_GIT}"
+)
+if [[ -n "$IMAGE_TAG_RUN" ]]; then
+  DOCKER_TAGS+=("-t" "${ECR_REPOSITORY_URL}:${IMAGE_TAG_RUN}")
+fi
+
+# Keep :latest updated unless the user explicitly asked for it to be something else.
+if [[ "$TAG" != "latest" ]]; then
+  DOCKER_TAGS+=("-t" "${ECR_REPOSITORY_URL}:latest")
+fi
+
+if [[ "${usage_no_cache:-}" == "true" ]]; then
+  "${DOCKER_BUILD[@]}" --no-cache \
+    --label "org.opencontainers.image.created=${OCI_CREATED}" \
+    --label "org.opencontainers.image.revision=${GIT_SHA}" \
+    ${OCI_SOURCE:+--label "org.opencontainers.image.source=${OCI_SOURCE}"} \
+    "${DOCKER_TAGS[@]}" \
+    "$APP_DIR"
+else
+  "${DOCKER_BUILD[@]}" \
+    --label "org.opencontainers.image.created=${OCI_CREATED}" \
+    --label "org.opencontainers.image.revision=${GIT_SHA}" \
+    ${OCI_SOURCE:+--label "org.opencontainers.image.source=${OCI_SOURCE}"} \
+    "${DOCKER_TAGS[@]}" \
+    "$APP_DIR"
+fi
+
+if [[ "${usage_push:-}" == "true" ]]; then
+  echo ""
+  echo "=== Authenticating with ECR ==="
+  ECR_REGISTRY="$(echo "$ECR_REPOSITORY_URL" | cut -d/ -f1)"
+  "$real_aws" ecr get-login-password --region "$REGION" |
+    docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+  echo ""
+  echo "=== Pushing Image ==="
+  docker push "${ECR_REPOSITORY_URL}:${TAG}"
+  docker push "${ECR_REPOSITORY_URL}:${IMAGE_TAG_GIT}"
+  if [[ -n "$IMAGE_TAG_RUN" ]]; then
+    docker push "${ECR_REPOSITORY_URL}:${IMAGE_TAG_RUN}"
+  fi
+  if [[ "$TAG" != "latest" ]]; then
+    docker push "${ECR_REPOSITORY_URL}:latest"
+  fi
+
+  echo ""
+  echo "=== Success ==="
+  echo "  Image pushed:"
+  echo "    ${ECR_REPOSITORY_URL}:${TAG}"
+  echo "    ${ECR_REPOSITORY_URL}:${IMAGE_TAG_GIT}"
+  if [[ -n "$IMAGE_TAG_RUN" ]]; then
+    echo "    ${ECR_REPOSITORY_URL}:${IMAGE_TAG_RUN}"
+  fi
+  if [[ "$TAG" != "latest" ]]; then
+    echo "    ${ECR_REPOSITORY_URL}:latest"
+  fi
+  echo ""
+  echo "  To deploy, update your Terraform or run:"
+  echo "    kubectl set image deployment/react2shell react2shell=${ECR_REPOSITORY_URL}:${TAG} -n react2shell"
+else
+  echo ""
+  echo "=== Build Complete ==="
+  echo "  Local image:"
+  echo "    ${ECR_REPOSITORY_URL}:${TAG}"
+  echo "    ${ECR_REPOSITORY_URL}:${IMAGE_TAG_GIT}"
+  echo ""
+  echo "  To push to ECR, run:"
+  echo "    mise run build-image --push"
+fi

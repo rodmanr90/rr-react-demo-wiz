@@ -1,0 +1,28 @@
+# Wiz Code-to-Cloud configuration
+# Managed in-repo (bucket name is deterministic per AWS account/region)
+# IMPORTANT: This file MUST be committed to git for Wiz Code scanning to work
+#
+# If you change AWS account/region or backend settings, update the bucket/region
+# values below and commit the updated iac_config.wiz files.
+#
+# This file helps Wiz resolve Terraform partial backend configurations
+# for code-to-cloud resource mapping.
+
+terraform:
+  dynamicBackends:
+    dev:
+      # Explicit S3 backend attributes for Wiz code-to-cloud mapping.
+      bucket: "demo-dev-864981757799-state-bucket-ap-southeast-2"
+      # NOTE: `bootstrap-branch` stores the backends module state under this key.
+      key: "bootstrap/terraform.tfstate"
+      region: "ap-southeast-2"
+      encrypt: true
+      use_lockfile: true
+    dev-stable:
+      # Deterministic backend bucket (same account + region) so this file can
+      # stay consistent even if the backend is destroyed/recreated.
+      bucket: "demo-dev-864981757799-state-bucket-ap-southeast-2"
+      key: "bootstrap/terraform.tfstate"
+      region: "ap-southeast-2"
+      encrypt: true
+      use_lockfile: true

@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+#MISE description="One-command destroy for infrastructure/demo (clean terraform-native approach)"
+
+#USAGE flag "--no-dry-run" help="Execute actual destruction. Without this flag, only shows what would be destroyed"
+#USAGE flag "--destroy-backend" help="Also destroy the backend state bucket + SSM parameter. Recommended for CI; optional locally."
+#USAGE flag "--no-wiz" help="Destroy the no-wiz root module (infrastructure/demo-nowiz)"
+
+set -eo pipefail
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+DEMO_DIR_REL="infrastructure/demo"
+if [[ "${usage_no_wiz:-}" == "true" ]]; then
+  DEMO_DIR_REL="infrastructure/demo-nowiz"
+fi
+DEMO_DIR="$GIT_ROOT/$DEMO_DIR_REL"
+
+# Default to dry-run for safety (like the reference implementation)
+DRY_RUN=true
+if [[ "${usage_no_dry_run:-}" == "true" ]]; then
+  DRY_RUN=false
+fi
+
+# By default, keep the backend when running locally to:
+# - avoid constantly recreating the state bucket
+# - keep committed iac_config.wiz stable for Wiz Code-to-Cloud mapping
+DESTROY_BACKEND=false
+if [[ "${usage_destroy_backend:-}" == "true" || "${DESTROY_BACKEND:-}" == "true" ]]; then
+  DESTROY_BACKEND=true
+fi
+
+REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-ap-southeast-2}}"
+
+echo ""
+echo "=============================================="
+echo "  Wiz Demo - Terraform Destroy"
+echo "=============================================="
+echo ""
+
+# -----------------------------------------------------------------------------
+# Step -1: Demo-only AWS credentials (guardrail)
+# -----------------------------------------------------------------------------
+# shellcheck source=/dev/null
+source "$(command -v demo-aws.sh)"
+demo_aws_activate
+
+# -----------------------------------------------------------------------------
+# Prerequisites Check
+# -----------------------------------------------------------------------------
+echo "📋 Checking prerequisites..."
+
+echo "✅ Region: $REGION"
+echo "✅ Terraform root: $DEMO_DIR_REL"
+
+if [[ ! -f "$DEMO_DIR/backend.tf" ]]; then
+  echo "⚠️  No backend.tf found in $DEMO_DIR"
+  echo "   Skipping terraform destroy for demo resources (likely no deploy happened)."
+  echo "   Will still attempt backend cleanup to avoid leaking state buckets."
+  SKIP_DEMO_DESTROY=true
+else
+  SKIP_DEMO_DESTROY=false
+fi
+if [[ "$SKIP_DEMO_DESTROY" != "true" ]]; then
+  echo "✅ Backend configuration found"
+fi
+
+echo ""
+echo "You are currently authenticated to AWS as:"
+aws sts get-caller-identity --query Arn --output text
+echo ""
+
+# -----------------------------------------------------------------------------
+# Dry-Run / Confirmation
+# -----------------------------------------------------------------------------
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "=== DRY RUN MODE: No resources will be destroyed ==="
+  echo "Use --no-dry-run flag to actually destroy resources"
+  echo ""
+  if [[ "$SKIP_DEMO_DESTROY" != "true" ]]; then
+    echo "🔍 Running terraform plan -destroy..."
+    echo ""
+
+    cd "$DEMO_DIR"
+    terraform plan -destroy
+  else
+    echo "ℹ️  No demo backend configured; skipping terraform plan -destroy."
+  fi
+
+  echo ""
+  echo "=============================================="
+  echo "  Dry Run Complete"
+  echo "=============================================="
+  echo ""
+  echo "To actually destroy, run:"
+  echo "  mise run destroy-demo --no-dry-run"
+  echo ""
+  exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Terraform Destroy
+# -----------------------------------------------------------------------------
+echo "⚠️  WARNING: You are about to destroy all resources!"
+echo "⚠️  You have 5 seconds to cancel (CTRL-C)..."
+sleep 5
+
+if [[ "$SKIP_DEMO_DESTROY" != "true" ]]; then
+  cd "$DEMO_DIR"
+  # Ensure Terraform can read outputs and destroy against the configured backend.
+  terraform init -input=false >/dev/null
+  DEPLOYMENT_NAME="$(terraform output -raw deployment_name 2>/dev/null || terraform output -raw suffix 2>/dev/null || true)"
+  if [[ -n "$DEPLOYMENT_NAME" && "$DEPLOYMENT_NAME" != "null" ]]; then
+    echo "✅ Deployment name: $DEPLOYMENT_NAME"
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Best-effort: update kubeconfig so pre-destroy cleanup can use kubectl
+# -----------------------------------------------------------------------------
+if [[ "$SKIP_DEMO_DESTROY" != "true" ]]; then
+  # Prefer outputs, but after a partially-failed destroy Terraform can end up
+  # with an outputs-less state snapshot. Fall back to reading from state.
+  CLUSTER_NAME="$(terraform output -raw cluster_name 2>/dev/null || true)"
+  if [[ -z "$CLUSTER_NAME" ]]; then
+    CLUSTER_ADDR="$(terraform state list 2>/dev/null | grep -E '^module\\.eks\\[[0-9]+\\]\\.aws_eks_cluster\\.this\\[[0-9]+\\]$' | head -n 1 || true)"
+    if [[ -n "$CLUSTER_ADDR" ]]; then
+      CLUSTER_NAME="$(terraform state show -no-color "$CLUSTER_ADDR" 2>/dev/null | awk '$1=="name"{gsub(/"/,"",$3); print $3; exit}' || true)"
+    fi
+  fi
+  if [[ -n "$CLUSTER_NAME" ]]; then
+    export KUBECONFIG="${KUBECONFIG:-$GIT_ROOT/kubeconfig}"
+    aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" --kubeconfig "$KUBECONFIG" >/dev/null 2>&1 || true
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Pre-Destroy Cleanup (AWS LB Controller resources)
+# -----------------------------------------------------------------------------
+VPC_ID=""
+if [[ "$SKIP_DEMO_DESTROY" != "true" ]]; then
+  echo "🔍 Getting VPC ID from Terraform state..."
+  # Prefer outputs, but after a partially-failed destroy Terraform can end up
+  # with an outputs-less state snapshot. Fall back to reading from state.
+  VPC_ID="$(terraform output -raw vpc_id 2>/dev/null | grep -oE 'vpc-[0-9a-f]+' | head -n 1 || true)"
+  if [[ -z "$VPC_ID" ]]; then
+    VPC_ADDR="$(terraform state list 2>/dev/null | grep -E '^module\\.vpc\\.aws_vpc\\.this\\[[0-9]+\\]$' | head -n 1 || true)"
+    if [[ -n "$VPC_ADDR" ]]; then
+      VPC_ID="$(terraform state show -no-color "$VPC_ADDR" 2>/dev/null | awk '$1=="id"{gsub(/"/,"",$3); print $3; exit}' || true)"
+    fi
+  fi
+
+  # If Terraform can't read state (e.g., lock issues), fall back to AWS tags.
+  # Safety: only auto-select when exactly one matching VPC exists.
+  if [[ -z "$VPC_ID" ]]; then
+    VPC_CANDIDATES="$(aws ec2 describe-vpcs --region "$REGION" \
+      --filters "Name=tag:Project,Values=WizDemo" "Name=tag:ManagedBy,Values=Terraform" \
+      --query 'Vpcs[*].VpcId' --output text 2>/dev/null || true)"
+    VPC_CANDIDATES="$(echo "$VPC_CANDIDATES" | tr '\t' '\n' | sed '/^$/d')"
+
+    if [[ -n "$VPC_CANDIDATES" ]]; then
+      VPC_COUNT="$(printf '%s\n' "$VPC_CANDIDATES" | wc -l | tr -d ' ')"
+    else
+      VPC_COUNT="0"
+    fi
+
+    if [[ "$VPC_COUNT" == "1" ]]; then
+      VPC_ID="$(echo "$VPC_CANDIDATES" | head -n 1)"
+    fi
+  fi
+fi
+
+if [[ -n "$VPC_ID" ]]; then
+  echo "✅ VPC ID: $VPC_ID"
+  echo ""
+  echo "🧹 Running pre-destroy cleanup..."
+  echo "This will delete any NLBs, target groups, and k8s-* security groups in the VPC."
+  echo ""
+  "$GIT_ROOT/.mise-tasks/scripts/pre-destroy-cleanup" "$VPC_ID" "$REGION"
+else
+  echo "⚠️  Could not get VPC ID from Terraform state"
+  echo "   Skipping pre-destroy cleanup. If destroy fails, you may need to"
+  echo "   manually delete NLBs and security groups."
+fi
+
+echo ""
+echo "🗑️  Running terraform destroy..."
+echo ""
+
+# Function to run terraform destroy with state lock handling
+run_terraform_destroy() {
+  local log_file
+  local exit_code=0
+  log_file="$(mktemp)"
+
+  # Stream output (critical for long-running EKS teardowns) while still having
+  # a log to grep for specific errors (e.g., state locks).
+  set +e
+  terraform destroy -auto-approve 2>&1 | tee "$log_file"
+  exit_code=${PIPESTATUS[0]}
+  set -e
+
+  # Check if we hit a state lock error
+  if grep -q "Error acquiring the state lock" "$log_file"; then
+    echo ""
+    echo "⚠️  State lock detected - force unlocking..."
+    # The lock block lines may be prefixed (e.g., box-drawing characters). Find
+    # the token "ID:" and read the next field.
+    LOCK_ID="$(awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i == \"ID:\") { print $(i+1); exit }
+      }
+    }' "$log_file" 2>/dev/null | tr -d '\r' || true)"
+    LOCK_PATH="$(awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i == \"Path:\") { print $(i+1); exit }
+      }
+    }' "$log_file" 2>/dev/null | tr -d '\r' || true)"
+
+    # S3 native locking (use_lockfile=true) uses a *.tflock object.
+    # terraform force-unlock may be insufficient in some cases (e.g. cancelled CI
+    # runs). As a fallback, delete the lockfile directly from S3.
+    #
+    # LOCK_PATH looks like: <bucket>/<key>
+    if [[ -n "$LOCK_PATH" ]]; then
+      LOCK_BUCKET="${LOCK_PATH%%/*}"
+      LOCK_KEY="${LOCK_PATH#*/}.tflock"
+    else
+      LOCK_BUCKET=""
+      LOCK_KEY=""
+    fi
+
+    if [[ -n "$LOCK_ID" ]]; then
+      terraform force-unlock -force "$LOCK_ID" 2>/dev/null || true
+      if [[ -n "$LOCK_BUCKET" && -n "$LOCK_KEY" ]]; then
+        echo "  ⚠️  Deleting S3 lockfile (fallback): s3://${LOCK_BUCKET}/${LOCK_KEY}"
+        aws s3api delete-object --bucket "$LOCK_BUCKET" --key "$LOCK_KEY" --region "$REGION" >/dev/null 2>&1 || true
+        # Give S3 a moment before retrying.
+        sleep 2
+      fi
+      echo "  ✅ State unlocked, retrying destroy..."
+      terraform destroy -auto-approve
+      rm -f "$log_file" 2>/dev/null || true
+      return $?
+    fi
+  fi
+
+  rm -f "$log_file" 2>/dev/null || true
+  return $exit_code
+}
+
+DEMO_DESTROY_FAILED=false
+if [[ "$SKIP_DEMO_DESTROY" != "true" ]]; then
+  if run_terraform_destroy; then
+    echo "✅ Terraform destroy succeeded"
+  else
+    echo ""
+    echo "⚠️  Terraform destroy failed. Running cleanup and retrying once..."
+    echo ""
+
+    # Run cleanup again in case there are orphaned resources
+    if [[ -n "$VPC_ID" ]]; then
+      "$GIT_ROOT/.mise-tasks/scripts/pre-destroy-cleanup" "$VPC_ID" "$REGION"
+    fi
+
+    echo ""
+    echo "🔄 Retrying terraform destroy..."
+    if run_terraform_destroy; then
+      echo "✅ Terraform destroy succeeded on retry"
+    else
+      echo ""
+      echo "❌ Terraform destroy failed after retry; continuing with backend cleanup."
+      DEMO_DESTROY_FAILED=true
+    fi
+  fi
+else
+  echo "ℹ️  Skipping terraform destroy (no demo backend.tf)."
+fi
+
+# If the demo resources didn't fully destroy, do not attempt backend teardown.
+# Keeping the backend intact preserves state for troubleshooting and prevents
+# orphaning resources by "forgetting" the backend config.
+if [[ "$DEMO_DESTROY_FAILED" == "true" && "$DESTROY_BACKEND" == "true" ]]; then
+  echo ""
+  echo "❌ Demo destroy failed; skipping backend destruction to avoid orphaning resources."
+  echo "Re-run: mise run destroy-demo --no-dry-run"
+  exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Verification
+# -----------------------------------------------------------------------------
+echo ""
+echo "🔍 Verifying clean state..."
+
+echo "  EKS clusters:"
+EKS_CLUSTERS=`aws eks list-clusters --region "$REGION" --query 'clusters' --output text 2>/dev/null || echo ""`
+if [[ -z "$EKS_CLUSTERS" ]]; then
+  echo "    ✅ None"
+else
+  echo "    ⚠️  Found: $EKS_CLUSTERS"
+fi
+
+echo "  VPCs with WizDemo tag:"
+VPCS=`aws ec2 describe-vpcs --region "$REGION" \
+  --filters "Name=tag:Project,Values=WizDemo" \
+  --query 'Vpcs[*].VpcId' --output text 2>/dev/null || echo ""`
+if [[ -z "$VPCS" ]]; then
+  echo "    ✅ None"
+else
+  echo "    ⚠️  Found: $VPCS"
+fi
+
+# -----------------------------------------------------------------------------
+# Backend Cleanup (migrate to local state, then terraform destroy bucket)
+# -----------------------------------------------------------------------------
+if [[ "$DESTROY_BACKEND" != "true" ]]; then
+  echo ""
+  echo "ℹ️  Keeping backend infrastructure (pass --destroy-backend to remove state bucket + SSM parameter)."
+  echo ""
+
+  if [[ "$DEMO_DESTROY_FAILED" == "true" ]]; then
+    exit 1
+  fi
+
+  echo "=============================================="
+  echo "  Destroy Complete!"
+  echo "=============================================="
+  echo ""
+  echo "Backend retained (faster next deploy)."
+  echo "Run: mise run deploy-demo"
+  echo ""
+  exit 0
+fi
+
+echo ""
+echo "🗑️  Cleaning up backend infrastructure (--destroy-backend)..."
+
+BACKEND_CONFIG="$GIT_ROOT/infrastructure/backend-config.json"
+BACKENDS_DIR="$GIT_ROOT/infrastructure/backends"
+BACKEND_CLEANUP_FAILED=false
+
+empty_and_delete_bucket() {
+  local bucket="$1"
+  local region="$2"
+
+  if [[ -z "$bucket" ]]; then
+    return 1
+  fi
+
+  # Safety: only allow deleting buckets that match our deterministic naming.
+  # Expected: demo-<env>-<account>-state-bucket-<region>
+  if [[ "$bucket" != demo-*-state-bucket-* ]]; then
+    echo "  ❌ Refusing to delete unexpected bucket name: $bucket" >&2
+    return 1
+  fi
+
+  echo "  🧨 Fallback: emptying + deleting bucket via AWS API (handles versioned buckets)..."
+  echo "    Bucket: $bucket"
+
+  # Delete all versions and delete markers (required for versioned buckets).
+  while true; do
+    local page
+    page="$(aws s3api list-object-versions --bucket "$bucket" --region "$region" --output json 2>/dev/null || true)"
+    if [[ -z "$page" ]]; then
+      break
+    fi
+
+    local delete_payload
+    delete_payload="$(echo "$page" | jq -c '{
+      Objects: (
+        ( .Versions // [] | map({Key: .Key, VersionId: .VersionId}) ) +
+        ( .DeleteMarkers // [] | map({Key: .Key, VersionId: .VersionId}) )
+      )
+    }')"
+    local count
+    count="$(echo "$delete_payload" | jq -r '.Objects | length')"
+
+    if [[ "$count" == "0" ]]; then
+      break
+    fi
+
+    # Best-effort: keep going even if one batch fails.
+    aws s3api delete-objects --bucket "$bucket" --region "$region" --delete "$delete_payload" >/dev/null 2>&1 || true
+  done
+
+  # Final delete
+  aws s3api delete-bucket --bucket "$bucket" --region "$region" >/dev/null 2>&1
+}
+
+if [[ -f "$BACKEND_CONFIG" ]]; then
+  # The backends module requires certain variables (e.g. environment) even when
+  # destroying. In GitHub Actions these won't be set unless we export them.
+  BACKEND_ENVIRONMENT="$(jq -r '.environment // empty' "$BACKEND_CONFIG" 2>/dev/null || true)"
+  BACKEND_BRANCH="$(jq -r '.branch // empty' "$BACKEND_CONFIG" 2>/dev/null || true)"
+  BACKEND_REGION="$(jq -r '.state.region // empty' "$BACKEND_CONFIG" 2>/dev/null || true)"
+
+  export TF_VAR_environment="${TF_VAR_environment:-${BACKEND_ENVIRONMENT:-dev}}"
+  export TF_VAR_branch="${TF_VAR_branch:-${BACKEND_BRANCH:-main}}"
+  export TF_VAR_aws_region="${TF_VAR_aws_region:-${BACKEND_REGION:-$REGION}}"
+
+  STATE_BUCKET=$(jq -r '.state.bucket' "$BACKEND_CONFIG" 2>/dev/null || echo "")
+
+  if [[ -n "$STATE_BUCKET" ]] && aws s3api head-bucket --bucket "$STATE_BUCKET" --region "$REGION" 2>/dev/null; then
+    echo "  State bucket exists: $STATE_BUCKET"
+    echo "  Migrating state to local and destroying via Terraform..."
+
+    cd "$BACKENDS_DIR"
+
+    if [[ -f backend.tf && -f backend.hcl ]]; then
+      # Step 1: Ensure we're initialized against the remote backend (S3).
+      echo "    Initializing remote backend..."
+      if terraform init -input=false -reconfigure >/dev/null; then
+        # Step 2: Switch to local backend by removing backend config and migrating state.
+        # This avoids Terraform trying to delete the bucket while still using it as the backend.
+        echo "    Migrating backend state to local..."
+        mv backend.tf backend.tf.bak 2>/dev/null || true
+        mv backend.hcl backend.hcl.bak 2>/dev/null || true
+
+        if terraform init -input=false -migrate-state -force-copy; then
+          # Step 3: Destroy bootstrap resources (bucket is force_destroy=true).
+          echo "    Running terraform destroy on backends..."
+          if terraform destroy -input=false -auto-approve; then
+            echo "    ✅ State bucket destroyed via Terraform"
+          else
+            echo "    ❌ Backend terraform destroy failed"
+            BACKEND_CLEANUP_FAILED=true
+          fi
+        else
+          echo "    ❌ Backend state migration failed"
+          BACKEND_CLEANUP_FAILED=true
+        fi
+      else
+        echo "    ❌ Backend terraform init failed"
+        BACKEND_CLEANUP_FAILED=true
+      fi
+    else
+      echo "  ⚠️  Missing backend.tf/backend.hcl in $BACKENDS_DIR; skipping backend cleanup"
+      BACKEND_CLEANUP_FAILED=true
+    fi
+
+    cd "$GIT_ROOT"
+  else
+    echo "  ✅ State bucket not found or already deleted"
+  fi
+else
+  echo "  ⚠️  No backend configuration found - skipping bucket cleanup"
+fi
+
+if [[ "$BACKEND_CLEANUP_FAILED" != "true" ]]; then
+  # Delete SSM parameter (stores backend config for the branch)
+  BRANCH=""
+  if [[ -f "$BACKEND_CONFIG" ]]; then
+    BRANCH="$(jq -r '.branch // empty' "$BACKEND_CONFIG" 2>/dev/null || true)"
+  fi
+  if [[ -z "$BRANCH" ]]; then
+    BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$BRANCH" ]]; then
+    SSM_PARAM_NAME="/demo/terraform/backend/${BRANCH}/config"
+    echo "  Deleting SSM parameter: $SSM_PARAM_NAME"
+    if aws ssm delete-parameter --name "$SSM_PARAM_NAME" --region "$REGION" 2>/dev/null; then
+      echo "    ✅ Deleted SSM parameter"
+    else
+      echo "    ℹ️  SSM parameter not found or already deleted"
+    fi
+  else
+    echo "  ⚠️  Could not determine backend branch name; skipping SSM parameter deletion for safety"
+  fi
+
+  # Remove backend configuration files (clean slate for next deploy)
+  echo "  Removing backend configuration files..."
+  rm -f "$BACKEND_CONFIG"
+  rm -f "$DEMO_DIR/backend.hcl"
+else
+  echo "  ❌ Backend cleanup failed; attempting AWS fallback deletion..."
+  if [[ -n "${STATE_BUCKET:-}" ]]; then
+    if empty_and_delete_bucket "$STATE_BUCKET" "$REGION"; then
+      echo "    ✅ State bucket deleted via AWS fallback"
+      BACKEND_CLEANUP_FAILED=false
+    else
+      echo "    ❌ AWS fallback bucket delete failed"
+    fi
+  else
+    echo "    ❌ No bucket name available for fallback delete"
+  fi
+
+  if [[ "$BACKEND_CLEANUP_FAILED" == "true" ]]; then
+    echo "  ❌ Backend cleanup failed; leaving backend-config.json and SSM parameter intact for recovery."
+    exit 1
+  fi
+
+  # Best-effort: delete SSM parameter and local config even if Terraform backend
+  # destruction failed, as long as the bucket is now deleted.
+  BRANCH="$(jq -r '.branch // empty' "$BACKEND_CONFIG" 2>/dev/null || true)"
+  if [[ -z "$BRANCH" ]]; then
+    BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  fi
+  if [[ -n "$BRANCH" ]]; then
+    SSM_PARAM_NAME="/demo/terraform/backend/${BRANCH}/config"
+    echo "  Deleting SSM parameter: $SSM_PARAM_NAME"
+    aws ssm delete-parameter --name "$SSM_PARAM_NAME" --region "$REGION" >/dev/null 2>&1 || true
+  fi
+  echo "  Removing backend configuration files..."
+  rm -f "$BACKEND_CONFIG"
+  rm -f "$DEMO_DIR/backend.hcl"
+fi
+rm -f "$DEMO_DIR/backend.tf"
+rm -f "$BACKENDS_DIR/backend.hcl"
+rm -f "$BACKENDS_DIR/backend.tf"
+rm -f "$BACKENDS_DIR/backend.hcl.bak"
+rm -f "$BACKENDS_DIR/backend.tf.bak"
+rm -rf "$DEMO_DIR/.terraform"
+rm -f "$DEMO_DIR/.terraform.lock.hcl"
+rm -rf "$BACKENDS_DIR/.terraform"
+rm -f "$BACKENDS_DIR/.terraform.lock.hcl"
+
+echo "    ✅ Removed all backend files and terraform state directories"
+
+echo ""
+echo "=============================================="
+echo "  Destroy Complete!"
+echo "=============================================="
+echo ""
+echo "Next deployment will use the supplied deployment name, or auto-generate a new one."
+echo "Run: mise run deploy-demo"
+echo ""
+
+if [[ "$DEMO_DESTROY_FAILED" == "true" || "$BACKEND_CLEANUP_FAILED" == "true" ]]; then
+  exit 1
+fi

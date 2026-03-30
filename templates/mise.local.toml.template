@@ -1,0 +1,61 @@
+# =============================================================================
+# mise.local.toml - Local Development Configuration
+# =============================================================================
+# This file is for local overrides and personal development settings.
+# It should be copied to mise.local.toml in the project root and customized.
+# NOTE: mise.local.toml is gitignored - do not commit your local config.
+# =============================================================================
+
+[tools]
+# Add any additional tools you find helpful here.
+# Consider suggesting additions to the main mise.toml for team-wide use.
+
+[env]
+# =============================================================================
+# Wiz Environment Configuration
+# =============================================================================
+# Wiz environment for in-cluster components (passed as WIZ_ENV to Wiz Helm charts).
+# Common values: prod (default), commercial, gov.
+TF_VAR_wiz_client_environment="prod"
+
+# =============================================================================
+# AWS Region Configuration
+# =============================================================================
+AWS_REGION="ap-southeast-2"
+TF_VAR_aws_region="ap-southeast-2"
+
+# =============================================================================
+# Feature Toggles (infrastructure/demo)
+# =============================================================================
+TF_VAR_create_eks="true"
+TF_VAR_create_react2shell="true"
+TF_VAR_create_wiz_connector="true"
+TF_VAR_create_wiz_k8s_integration="true"
+
+# =============================================================================
+# Network Access Control
+# =============================================================================
+# Auto-detect public IP and add to allowed CIDRs
+# When true, `mise run get-my-ip` will fetch your public IP and set TF_VAR_allowed_cidrs
+AUTO_DETECT_PUBLIC_IP="true"
+
+# Allowed CIDRs for accessing the demo application
+# If AUTO_DETECT_PUBLIC_IP is false, manually add your IP here (e.g., '["YOUR_IP/32"]')
+# If AUTO_DETECT_PUBLIC_IP is true, this will be overridden by `mise run get-my-ip`
+TF_VAR_allowed_cidrs='[]'
+
+# Wiz Dynamic Scanner IPs (for attack surface scanning)
+# These are region-specific - update based on your Wiz tenant region
+# See: https://docs.wiz.io/wiz-docs/docs/dynamic-scanner-ip-addresses
+TF_VAR_dynamic_scanner_ipv4s_develop="54.153.167.0/32,54.206.253.144/32,54.66.162.244/32,13.238.102.51/32,54.66.150.182/32,3.24.191.170/32"
+
+# =============================================================================
+# Scenario Toggles
+# =============================================================================
+# (The scenario toggle is TF_VAR_create_react2shell above)
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+# Control which Wiz Defend log types are enabled.
+TF_VAR_enabled_logs='{"cloudtrail":true,"route53_logs":true}'
